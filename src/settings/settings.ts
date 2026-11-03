@@ -76,6 +76,7 @@ export class Settings {
             npmPackageConfigName?: string | undefined;
             profileParameterName?: string | undefined;
             defaultValue?: returnType | undefined;
+            notFoundIsExpected?: boolean;
         },
     ): SettingResult<returnType> {
         return Utils.getSetting(logLevel, settingName, sources, Settings._current);

@@ -202,12 +202,17 @@ export class Utils {
     private static matchesShape(value: unknown, expectedShape: keyof AssertShapeMap): boolean {
         switch (expectedShape) {
             case 'nonNullObject':
+                // Must be an object, not null (typeof null === 'object' in JS), and not an array —
+                // callers of this shape want something they can spread/read named properties off.
                 return value !== null && typeof value === 'object' && !Array.isArray(value);
             case 'nonEmptyString':
+                // Must actually be a string, and have at least one character.
                 return typeof value === 'string' && value.length > 0;
             case 'positiveNumber':
+                // Must be a real number (not NaN/Infinity) and strictly greater than zero.
                 return typeof value === 'number' && Number.isFinite(value) && value > 0;
             case 'port':
+                // Must be a whole number within the valid TCP port range (1-65535 inclusive).
                 return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 65535;
             default:
                 // Compile-time exhaustiveness check: if AssertShapeMap gains a key without a
@@ -237,10 +242,15 @@ export class Utils {
      * Utils.describeValue("hello"); // "string (length 5)"
      */
     static describeValue(value: unknown): string {
+        // null and undefined both report as 'object'/'undefined' from typeof in confusing ways
+        // (typeof null === 'object'), so check for them explicitly first, before typeof is used.
         if (value === null) return 'null';
         if (value === undefined) return 'undefined';
         const type = typeof value;
         if (type === 'function') {
+            // Try to read the function's own name (e.g. a named function or arrow assigned to a
+            // const) — wrapped in try/catch because this helper must never itself throw, even for
+            // a hostile/proxy value whose .name getter throws.
             try {
                 const name = (value as { name?: string }).name;
                 return `function (${name || 'anonymous'})`;
@@ -249,6 +259,9 @@ export class Utils {
             }
         }
         if (type === 'object') {
+            // Read the constructor name (e.g. "Array", "Date", or a custom class) to distinguish
+            // plain objects from more specific object types — again guarded against a hostile
+            // value whose .constructor access itself throws.
             try {
                 const ctorName = (value as object).constructor?.name;
                 return `object (${ctorName || 'Object'})`;
@@ -257,12 +270,16 @@ export class Utils {
             }
         }
         if (type === 'string') {
+            // Report only the length, never the string's own content — see this function's
+            // top-level doc comment for why content is deliberately never included.
             try {
                 return `string (length ${(value as string).length})`;
             } catch {
                 return 'string';
             }
         }
+        // Every other primitive type (number, boolean, bigint, symbol) — the bare typeof result
+        // is already a safe, bounded, content-free description.
         return type;
     }
 
@@ -282,8 +299,14 @@ export class Utils {
      * }
      */
     static errorMessage(err: unknown): string {
+        // The common case — a real Error (or subclass) thrown normally — just read .message.
         if (err instanceof Error) return err.message;
+        // A bare string was thrown (e.g. `throw "oops"`) — it already IS the message.
         if (typeof err === 'string') return err;
+        // Anything else (a thrown object, number, null, undefined, ...) — best-effort render it
+        // via JSON.stringify so the shape is still visible. JSON.stringify(undefined) returns
+        // `undefined` (not a string), hence the `?? String(err)` fallback. JSON.stringify can
+        // also throw itself (circular reference, BigInt, ...), hence the catch -> String(err).
         try {
             return JSON.stringify(err) ?? String(err);
         } catch {
@@ -313,16 +336,25 @@ export class Utils {
      * Utils.safeStringify(hugeArray, { maxLength: 200 }); // '[...]... (truncated, 48213 total chars)'
      */
     static safeStringify(value: unknown, options?: { maxLength?: number }): string {
+        // Validate the caller-supplied maxLength — fall back to the default (1000) for anything
+        // that isn't a genuinely usable positive finite number, rather than letting a bad option
+        // (0, negative, NaN, a string) silently break the truncation logic below.
         const maxLength =
             typeof options?.maxLength === 'number' && Number.isFinite(options.maxLength) && options.maxLength > 0
                 ? options.maxLength
                 : 1000;
         let result: string;
         try {
+            // JSON.stringify(undefined) returns `undefined` (not a string) — fall back to
+            // String(value) so the result here is always a real string.
             result = JSON.stringify(value) ?? String(value);
         } catch (err) {
+            // Stringification itself failed (circular reference, BigInt, ...) — never let that
+            // propagate out of a "safe" helper; fall back to the type/shape description instead.
             return `<unable to stringify: ${Utils.errorMessage(err)}> (${Utils.describeValue(value)})`;
         }
+        // Truncate anything over the configured bound, but keep the true original length visible
+        // in the marker so a reader knows how much was cut, not just that truncation happened.
         return result.length > maxLength ? `${result.slice(0, maxLength)}... (truncated, ${result.length} total chars)` : result;
     }
 
@@ -374,8 +406,11 @@ export class Utils {
     static isTrue(valueToCheck: boolean | string | number | undefined): boolean {
         switch (typeof valueToCheck) {
             case "boolean":
+                // Already a boolean — nothing to interpret, return it as-is.
                 return valueToCheck;
             case "string": {
+                // Lowercase and trim first so callers don't need to worry about case or
+                // surrounding whitespace (" Yes ", "TRUE", etc. all match).
                 const normalizedValue = valueToCheck.toLowerCase().trim();
                 return (
                     normalizedValue === "y" ||
@@ -386,8 +421,10 @@ export class Utils {
                 );
             }
             case "number":
+                // Any positive number counts as truthy; zero and negative numbers do not.
                 return valueToCheck > 0;
             default:
+                // undefined (or anything else typeof could return) — treat as not true.
                 return false;
         }
     }
@@ -434,9 +471,18 @@ export class Utils {
      * @note Durations above 359,999,000 ms (99h 59m 59s) will give unexpected results.
      */
     static msToHMS(milliSeconds: number): string {
+        // How many whole 24h days does the duration span? A plain `new Date(milliSeconds)`
+        // would wrap back to 00:00:00 past 24h, losing that — so days are tracked separately.
         const wholeDays = Math.floor(milliSeconds / MS_PER_DAY);
+        // Strip the whole-days portion off, leaving a remainder under 24h that a Date's own
+        // UTC getters can read directly.
         const date = new Date(milliSeconds - wholeDays * MS_PER_DAY);
+        // Re-add the stripped days back in as extra hours, so durations over 24h still show a
+        // correct (if non-standard, e.g. "26:00:00") hour count rather than wrapping to "02:00:00".
         const hours = wholeDays * 24 + date.getUTCHours();
+        // Hours is padded to at least 2 digits, but allowed to grow wider for very long
+        // durations (e.g. "100" stays "100", not truncated back to 2 digits); minutes/seconds
+        // are always exactly 2 digits; the fractional part is tenths of a second (ms / 100, rounded).
         return `${this.pad(hours, ("" + hours).length > 2 ? ("" + hours).length : 2)}:${this.pad(date.getUTCMinutes(), 2)}:${this.pad(date.getUTCSeconds(), 2)}.${Math.round(date.getUTCMilliseconds() / 100)}`;
     }
 
@@ -449,8 +495,15 @@ export class Utils {
      * @returns A random integer inclusively between `min` and `max`.
      */
     static getRandomInt(min: number, max: number): number {
+        // Figure out which of the two arguments is actually the lower bound — if the caller
+        // passed them reversed (max < min), swap them here rather than producing a nonsensical
+        // (or infinite-loop-prone) range below. Also rounds each bound inward (ceil the lower
+        // bound, floor the upper bound) so a fractional input can't widen the inclusive range.
         const minMax = min < max ? Math.ceil(min) : Math.ceil(max);
         const maxMin = min < max ? Math.floor(max) : Math.floor(min);
+        // Standard inclusive-random-integer formula: scale Math.random()'s [0,1) output across
+        // the (inclusive) range width + 1, floor it down to a whole number, then shift up by the
+        // lower bound.
         return Math.floor(Math.random() * (maxMin - minMax + 1)) + minMax;
     }
 
@@ -485,29 +538,42 @@ export class Utils {
     static writeTextToFile(filePath: string, fileName: string, data: string | object, ifExistsAction = ExistingFileWriteActions.AddIndex): void {
         let fullFilename = path.join(filePath, fileName);
         try {
+            // Make sure the destination directory actually exists first — `recursive: true`
+            // also creates any missing parent directories along the way.
             if (!existsSync(filePath)) {
-                Log.writeLine(LogLevels.FrameworkInformation, `Folder [${filePath}] does not exist so creating`);
+                Log.writeLine(LogLevels.TestDebug, `Folder [${filePath}] does not exist so creating`);
                 mkdirSync(filePath, { recursive: true });
             }
             if (existsSync(fullFilename)) {
-                Log.writeLine(LogLevels.FrameworkInformation, `File [${fullFilename}] exists so performing action [${ifExistsAction.toString()}]`);
+                // The target file already exists — what happens next depends entirely on
+                // ifExistsAction.
+                Log.writeLine(LogLevels.TestDebug, `File [${fullFilename}] exists so performing action [${ifExistsAction.toString()}]`);
                 switch (ifExistsAction) {
                     case ExistingFileWriteActions.AddIndex: {
+                        // Don't overwrite — instead find a free, incrementing index suffix and
+                        // recurse with that new name until we land on one that doesn't exist yet.
                         const splitFileName = fileName.split(".");
                         fileName =
                             splitFileName.length === 1
+                                // No extension at all (e.g. "hello") — just tack ".1" straight on.
                                 ? fileName + ".1"
                                 : ((splitFileName: string[]): string => {
                                     // If file name has 2 parts (e.g. hello.json) then add the index (e.g. hello.1.json)
                                     if (splitFileName.length === 2) {
                                         if (/^\d+$/.test(splitFileName[1])) {
+                                            // The "extension" is actually already a numeric index (e.g.
+                                            // "hello.1") — bump it rather than inserting a new one.
                                             return splitFileName[0] + "." + (parseInt(splitFileName[1]) + 1);
                                         } else {
+                                            // A normal two-part name (base + real extension) — insert
+                                            // ".1" between them.
                                             return splitFileName[0] + ".1." + splitFileName[1];
                                         }
                                     }
                                     // If file name has an index (e.g. hello.7.json or some.other.5.json) increment it
                                     if (/^\d+$/.test(splitFileName[splitFileName.length - 2])) {
+                                        // Second-to-last segment is already a numeric index — increment
+                                        // it in place, keeping the base name and real extension either side.
                                         return (
                                             splitFileName.slice(0, splitFileName.length - 2).join(".") +
                                             "." +
@@ -519,30 +585,48 @@ export class Utils {
                                     // 3+ part name without a numeric index (e.g. hello.addd.json) — add index (e.g. hello.addd.1.json)
                                     return splitFileName.slice(0, splitFileName.length - 1).join(".") + ".1." + splitFileName[splitFileName.length - 1];
                                 })(splitFileName);
+                        // Recurse with the newly-derived name — if THAT also already exists, this
+                        // same AddIndex branch runs again and bumps the index further, until a
+                        // genuinely free filename is found.
                         this.writeTextToFile(filePath, fileName, data, ifExistsAction);
                         break;
                     }
                     case ExistingFileWriteActions.Append: {
+                        // Add a leading newline so the appended content starts on its own line,
+                        // then tack the serialised data onto the end of the existing file.
                         appendFileSync(fullFilename, "\n" + Utils.serialiseFileData(data));
                         break;
                     }
                     case ExistingFileWriteActions.Overwrite: {
+                        // Replace the file's entire contents with the newly serialised data.
                         writeFileSync(fullFilename, Utils.serialiseFileData(data));
                         break;
                     }
                     case ExistingFileWriteActions.ThrowError: {
+                        // Caller explicitly wants a collision to be fatal — log and throw rather
+                        // than silently overwriting or appending to something that already exists.
                         const errText = `File [${fullFilename}] exists and action is ThrowError!`;
                         Log.logErrorAndThrow(errText);
                         break;
                     }
                     default: {
+                        // Defensive backstop — a value outside the ExistingFileWriteActions enum
+                        // (e.g. passed from untyped JS) has no defined behaviour, so fail loudly
+                        // rather than silently doing nothing.
                         const errText = `Cannot write to file [${fullFilename}] — unknown action [${ifExistsAction}]!`;
                         Log.logErrorAndThrow(errText);
                     }
                 }
             } else {
+                // The target file does NOT exist yet — no collision to resolve, but AddIndex
+                // still needs special handling below because a BARE name with an existing
+                // numeric "extension" (e.g. "hello.3") would otherwise get a redundant ".1"
+                // inserted even though nothing actually collided.
                 const splitFileName = fileName.split(".");
                 if (splitFileName.length === 1) {
+                    // No extension/dots at all — for AddIndex, start the numbering fresh at
+                    // ".1" even on a first write, for naming consistency with files that DO
+                    // eventually collide. Any other action just writes the file as given.
                     if (ifExistsAction === ExistingFileWriteActions.AddIndex) {
                         this.writeTextToFile(filePath, fileName + ".1", data, ifExistsAction);
                     } else {
@@ -554,20 +638,77 @@ export class Utils {
                         ifExistsAction === ExistingFileWriteActions.AddIndex &&
                         !/^\d+$/.test(splitFileName[splitFileName.length - 2])
                     ) {
+                        // AddIndex requested, and the name isn't already numbered (neither a
+                        // simple "base.N" pair nor a "base.N.ext" triple) — insert the initial
+                        // ".1" index now, before the existence check below, so every AddIndex
+                        // write (even the very first one) consistently carries an index.
                         fileName = splitFileName.slice(0, splitFileName.length - 1).join(".") + ".1." + splitFileName[splitFileName.length - 1];
                     }
                     fullFilename = path.join(filePath, fileName);
                     if (existsSync(fullFilename)) {
+                        // Inserting the ".1" above happened to collide with an existing file
+                        // after all (e.g. "hello.1.json" was already there) — recurse so the
+                        // AddIndex branch above can bump the index further.
                         this.writeTextToFile(filePath, fileName, data, ifExistsAction);
                     } else {
+                        // Genuinely free — write the file now.
                         writeFileSync(fullFilename, Utils.serialiseFileData(data));
                     }
                 }
             }
         } catch (err) {
+            // Catch-all for anything above (mkdir failure, write failure, a thrown
+            // logErrorAndThrow, ...) — log it, then re-throw so the caller still sees the failure.
             Log.writeLine(LogLevels.Error, `Unable to write text to file: ${err}`);
             throw err;
         }
+    }
+
+    /**
+     * Resolves a relative "test data" path against a single configured root, with no
+     * mock-vs-test distinction — any test suite's own `.feature` file (or anything else)
+     * that references a test data file by a relative path goes through here.
+     *
+     * The root resolves via {@link getSetting} — env var `CONTROLIUM_TEST_DATA_PATH`, then
+     * npm package config `testDataPath`, then a default of `<cwd>/testdata`. That default
+     * assumes the test command is invoked from the suite's own root — the same assumption
+     * virtually every comparable Node tool makes (Jest's `rootDir`, Vitest's `root`, ESLint's
+     * config resolution, etc. all default to `process.cwd()` for exactly this reason). It
+     * isn't bulletproof for every possible monorepo/workspace invocation style, but that's
+     * exactly why this is a configurable setting with an override, not a hardcoded path —
+     * a suite in an atypical setup overrides it once via the env var or npm config.
+     *
+     * Purely a path-resolution function — never checks the result exists, or reads anything.
+     * A nonexistent file/root surfaces naturally (and clearly) the moment something actually
+     * tries to read from the resolved path, e.g. via {@link getFileContents}.
+     *
+     * Always relative to the configured root, never absolute — a bare filename
+     * (`"hello.txt"`) resolves directly under it, and `..` segments intentionally escape
+     * upward *relative to that root* (`"../otherFolder/hello.txt"`) for a test that genuinely
+     * needs something outside the test-data folder. Nothing a caller passes can land at a
+     * true filesystem-absolute path regardless: `path.join` glues even a leading `/` onto
+     * the root rather than resetting to it (`resolveTestDataPath("/etc/passwd")` resolves to
+     * `<root>/etc/passwd`, not the real `/etc/passwd`). This is test infrastructure the test
+     * author themselves controls, not an untrusted-input boundary, so `..` is a deliberate
+     * escape hatch, not something defended against.
+     *
+     * @param relativePath - Path to resolve, relative to the configured test data root.
+     * @returns The resolved absolute (or root-relative, if the configured root itself is
+     *   relative) path.
+     * @throws {Error} If `relativePath` is not a non-empty string.
+     *
+     * @example
+     * Utils.resolveTestDataPath("headers/authHeaders.json");
+     * // => "/path/to/suite/testdata/headers/authHeaders.json"   (default root, no override)
+     */
+    static resolveTestDataPath(relativePath: string): string {
+        Utils.assertShape(relativePath, "nonEmptyString", "Utils.resolveTestDataPath", "relativePath");
+        const { value: root } = Utils.getSetting<string>(LogLevels.FrameworkInformation, "Test data path", {
+            processEnvName: "CONTROLIUM_TEST_DATA_PATH",
+            npmPackageConfigName: "testDataPath",
+            defaultValue: path.join(process.cwd(), "testdata"),
+        });
+        return path.join(root as string, relativePath);
     }
 
     /**
@@ -576,25 +717,24 @@ export class Utils {
      * @param path - Path to the file.
      * @param options - Optional settings:
      *   - `encoding` — File encoding (default: `"utf-8"`).
-     *   - `detokeniseFileContents` — When `true`, passes contents through the detokeniser before returning (default: `false`).
-     * @returns Contents of the file as a string.
+     * @returns Contents of the file as a string. To detokenise it, pass the result
+     *   through `Detokeniser.doAsync()` yourself — this stays a plain file read, no
+     *   dependency on `Detokeniser` (which itself depends on this module).
      * @throws {Error} If the file cannot be read.
      */
-    static getFileContents(filePath: string, options?: { encoding?: BufferEncoding; detokeniseFileContents?: boolean }): string {
-        const detokenise = options?.detokeniseFileContents ?? false;
+    static getFileContents(filePath: string, options?: { encoding?: BufferEncoding }): string {
         const encoding = options?.encoding ?? "utf-8";
         try {
-            Log.writeLine(LogLevels.FrameworkInformation, `Load file [${filePath}] using encoding [${encoding}]`);
+            // Read the raw bytes first (via getFileContentsBuffer, which has its own error
+            // handling/logging), then decode them to a string using the requested encoding.
+            Log.writeLine(LogLevels.TestDebug, `Load file [${filePath}] using encoding [${encoding}]`);
             const contents = this.getFileContentsBuffer(filePath).toString(encoding);
             Log.writeLine(LogLevels.FrameworkDebug, `Loaded [${contents.length}] characters`);
-            if (detokenise) {
-                // contents = Detokeniser.do(contents); Hey Claude, dont forget.  Masked out for now...
-                Log.writeLine(LogLevels.FrameworkDebug, `After detokenisation [${contents.length}] characters`);
-                return contents;
-            }
             return contents;
         } catch (err) {
-            const errText = `Utils.getFileContents - Reading file using ${encoding} (${detokenise ? "" : "not "}detokenised) threw error: [${err}]`;
+            // Covers both a read failure bubbling up from getFileContentsBuffer and a failure
+            // in .toString(encoding) itself (e.g. an invalid/unsupported encoding name).
+            const errText = `Utils.getFileContents - Reading file using ${encoding} threw error: [${err}]`;
             Log.logErrorAndThrow(errText);
         }
     }
@@ -608,7 +748,7 @@ export class Utils {
      */
     static getFileContentsBuffer(filePath: string): Buffer {
         try {
-            Log.writeLine(LogLevels.FrameworkInformation, `Getting file contents from [${filePath}]`);
+            Log.writeLine(LogLevels.TestDebug, `Getting file contents from [${filePath}]`);
             return readFileSync(filePath);
         } catch (err) {
             const errText = `Utils.getFileContentsBuffer - readFileSync for path [${filePath}] threw error: [${err}]`;
@@ -636,6 +776,14 @@ export class Utils {
      *   - `npmPackageConfigName` — npm package config key.
      *   - `profileParameterName` — JSONPath into `contextParameters.parameters`.
      *   - `defaultValue` — Fallback if no other source resolves.
+     *   - `notFoundIsExpected` — When `true`, resolving to `undefined` with no
+     *     `defaultValue` is logged calmly (same `logLevel` as every other outcome) instead
+     *     of at `LogLevels.Error`. Default `false` — unresolved-with-no-fallback is, for
+     *     most callers, genuinely worth flagging loudly. Set this when the caller has its
+     *     *own* separate fallback (e.g. an already-set value it'll just leave untouched)
+     *     and "nothing configured here" is an entirely ordinary, expected outcome, not a
+     *     problem — see `@controlium/framework`'s `API_AUTWrapper.loadSettings` for
+     *     exactly this case.
      * @param contextParameters - Optional context used to resolve `profileParameterName`:
      *   - `parameters` — The actual object to query with `profileParameterName`.
      *   - `sourceName` — Label identifying what `parameters` *is* (e.g. `"World"` for a
@@ -664,28 +812,40 @@ export class Utils {
             npmPackageConfigName?: string | undefined;
             profileParameterName?: string | undefined;
             defaultValue?: returnType | undefined;
+            notFoundIsExpected?: boolean;
         },
         contextParameters?: SettingsContext,
     ): SettingResult<returnType> {
+        // Validate all three inputs up front — a bad logLevel/settingName/sources shape would
+        // otherwise surface as a confusing failure deep inside the resolution logic below.
         Utils.assertType(logLevel, "number", "Utils.getSetting", "logLevel");
         Utils.assertShape(settingName, "nonEmptyString", "Utils.getSetting", "settingName");
         Utils.assertShape(sources, "nonNullObject", "Utils.getSetting", "sources");
         const debugString = `Got setting [${settingName}] from `;
 
-        // Highest priority — process environment variable
+        // Highest priority — process environment variable. Only looked up at all if the
+        // caller actually supplied a processEnvName; otherwise returnValue stays undefined
+        // and this tier is skipped.
         let returnValue: unknown = sources.processEnvName ? process.env[sources.processEnvName] : undefined;
         if (!Utils.isUndefined(returnValue)) {
+            // Found a value here — resolve immediately, without even looking at the lower-
+            // priority sources below.
             Log.writeLine(logLevel, debugString + `env var [${sources.processEnvName}]. Value: <${returnValue as returnType}>`);
             return { value: returnValue as returnType, source: `Env var '${sources.processEnvName}'` };
         }
 
-        // Next priority — npm package config variable
+        // Next priority — npm package config variable. npm exposes these to a running script
+        // as `npm_package_config_<name>` env vars, so the lookup is really just a differently-
+        // prefixed env var read.
         returnValue = sources.npmPackageConfigName ? process.env["npm_package_config_" + sources.npmPackageConfigName] : undefined;
         if (!Utils.isUndefined(returnValue)) {
             Log.writeLine(logLevel, debugString + `npm package config var [${sources.npmPackageConfigName}]. Value: <${returnValue as returnType}>`);
             return { value: returnValue as returnType, source: `npm package config '${sources.npmPackageConfigName}'` };
         }
 
+        // Neither env var nor npm config resolved anything — fall through to the profile-
+        // parameter tier. Pull out the object to query and the cosmetic label used to describe
+        // it in the eventual `source` string.
         const parameters = contextParameters?.parameters;
         const sourceLabel = contextParameters?.sourceName ?? "Profile";
 
@@ -702,23 +862,37 @@ export class Utils {
         // same default/undefined result (the caller can't act differently either way, but a reader
         // debugging why a setting came back as the default needs to know which case it was).
         if (Utils.isUndefined(sources.profileParameterName) || matchCount !== 1) {
+            // No usable profile match (either no path was given, nothing matched, or more than
+            // one property matched) — fall through to defaultValue/undefined. Warn specifically
+            // on the ambiguous (>1 match) case, since that usually means the path is wrong.
             if (typeof matchCount === "number" && matchCount > 1) {
                 Log.writeLine(LogLevels.Warning, `Profile parameter [${sources.profileParameterName}] for setting [${settingName}] is ambiguous — matched ${matchCount} properties, expected exactly 1. Treating as not found.`);
             }
             returnValue = sources.defaultValue;
             if (Utils.isUndefined(returnValue)) {
-                Log.writeLine(LogLevels.Error, `Unable to determine value for setting [${settingName}]. Returning: <undefined>!`);
+                // Nothing resolved anywhere, and no default was given either — this is either a
+                // normal "not configured" outcome (if the caller flagged it as expected) or a
+                // genuine problem worth shouting about, depending on notFoundIsExpected.
+                if (sources.notFoundIsExpected) {
+                    Log.writeLine(logLevel, `Setting [${settingName}] not configured — no value to return.`);
+                } else {
+                    Log.writeLine(LogLevels.Error, `Unable to determine value for setting [${settingName}]. Returning: <undefined>!`);
+                }
                 return { value: undefined, source: "Not found" };
             } else {
+                // A defaultValue was supplied and nothing higher-priority overrode it — use it.
                 Log.writeLine(logLevel, debugString + `default value: <${returnValue as returnType}>`);
                 return { value: returnValue as returnType, source: "Default value" };
             }
         }
 
-        // Profile parameter name given AND exactly one match exists — use it
+        // Profile parameter name given AND exactly one match exists — use it. parameters must
+        // be present here (matchCount above was only computed when it was), but double-check
+        // explicitly rather than trusting that invariant silently.
         if (Utils.isNullOrUndefined(parameters)) {
             Log.logErrorAndThrow(`Settings: Caller defined Profile parameter [${sources.profileParameterName}] but contextParameters is null!`);
         }
+        // Re-resolve the single matching property and read its value out.
         returnValue = JsonUtils.getPropertiesMatchingPath(parameters, sources.profileParameterName as string)[0].value as returnType;
         // Strip the JSONPath root ("$." or "$") for a human-readable path — "$.eaTest.apiUrl" -> "eaTest.apiUrl".
         const humanReadablePath = (sources.profileParameterName as string).replace(/^\$\.?/, "");
@@ -743,16 +917,23 @@ export class Utils {
 
         const originalValueKeyName = ENV_VAR_ORIGINAL_PREAMBLE + varName;
         if (originalValueKeyName in process.env) {
+            // A saved original already exists — this isn't the first time this variable has
+            // been set via setProcessEnv, so leave the saved original alone (overwriting it now
+            // would lose the real pre-test value and restore the wrong thing later).
             Log.writeLine(LogLevels.TestDebug, `Env var [${varName}] has already been set (original value saved) — not overwriting saved original`);
             Log.writeLine(
                 LogLevels.FrameworkInformation,
                 `Original env var value is saved on first set only, to ensure the pre-test value can be restored.\nSubsequent sets do not overwrite the saved original.`
             );
         } else {
+            // First time this variable is being set — capture its current value before
+            // changing it, so resetProcessEnv can restore it later.
             const oldValue = process.env[varName];
             // Store "_undefined" if the var didn't previously exist, so resetProcessEnvs knows to delete it
             process.env[ENV_VAR_ORIGINAL_PREAMBLE + varName] = Utils.isUndefined(oldValue) ? "_undefined" : oldValue;
         }
+        // Finally, actually set the variable to the requested value (coerced to a string, since
+        // env vars are always strings).
         process.env[varName] = String(requiredValue);
     }
 
@@ -770,6 +951,8 @@ export class Utils {
 
         try {
             const originalValueKeyName = ENV_VAR_ORIGINAL_PREAMBLE + varName;
+            // No saved original exists at all — this variable was never touched by
+            // setProcessEnv, so there's nothing to restore. Log and bail out early.
             if (!(originalValueKeyName in process.env)) {
                 Log.writeLine(
                     LogLevels.FrameworkDebug,
@@ -779,18 +962,24 @@ export class Utils {
             }
             const originalValue = process.env[originalValueKeyName];
             if (originalValue === "_undefined") {
+                // The variable did not exist before setProcessEnv touched it — restore that
+                // "didn't exist" state by deleting it, rather than setting it to the literal
+                // string "_undefined".
                 Log.writeLine(
                     LogLevels.FrameworkDebug,
                     `Found [${originalValueKeyName}] (Value: ${originalValue}) so deleting [${varName}] and [${originalValueKeyName}]`
                 );
                 delete process.env[varName];
             } else {
+                // The variable had a real pre-test value — put it back exactly as it was.
                 Log.writeLine(
                     LogLevels.FrameworkDebug,
                     `Found [${originalValueKeyName}] (Value: ${originalValue}) so restoring [${varName}] to [${originalValue}] and deleting [${originalValueKeyName}]`
                 );
                 process.env[varName] = originalValue as string;
             }
+            // Either way, the saved-original bookkeeping key itself is no longer needed —
+            // clean it up so a later resetProcessEnvs sweep doesn't try to process it again.
             delete process.env[originalValueKeyName];
         } catch (err) {
             const errMess = `Error resetting environment variable [${varName}]: ${Utils.errorMessage(err)}`;
@@ -808,8 +997,12 @@ export class Utils {
      */
     public static resetProcessEnvs(): void {
         Object.keys(process.env)
+            // Find every bookkeeping key setProcessEnv created (one per modified variable).
             .filter((key) => key.startsWith(ENV_VAR_ORIGINAL_PREAMBLE))
+            // Strip the prefix back off to recover the real variable name each key is for.
             .map((key) => key.substring(ENV_VAR_ORIGINAL_PREAMBLE.length))
+            // Restore each one individually via resetProcessEnv, which also cleans up its own
+            // bookkeeping key as it goes.
             .forEach((varName) => Utils.resetProcessEnv(varName));
     }
 
@@ -824,7 +1017,13 @@ export class Utils {
      * @throws {Error} If `original` is not valid JSON (JSON5 allowed).
      */
     public static clone(original: object | string): object {
+        // Only proceed if the value is actually (JSON5-)serialisable — this clone technique
+        // works purely by round-tripping through JSON, so anything JSON can't represent
+        // (functions, circular references, etc.) can't be cloned this way.
         if (JsonUtils.isJson(original, true)) {
+            // If already a string, parse it directly (allowing JSON5 leniency); if it's an
+            // object, first stringify it to normalise it into the same JSON text form, then
+            // parse that back into a brand-new, fully independent object.
             return JsonUtils.parse(typeof original === "string" ? original : JSON.stringify(original as object), true);
         } else {
             const errText = "Object passed in is not valid JSON (JSON5 allowed) so cannot be cloned using JSON";
@@ -883,7 +1082,12 @@ export class Utils {
      */
     static unescapeHTML(str: string): string {
         Utils.assertType(str, "string", "unescapeHTML", "str");
+        // Literal apostrophes are re-encoded to &apos; first so decodeHTML treats them
+        // consistently alongside genuine entity references, rather than leaving a raw "'"
+        // character that's indistinguishable from one decodeHTML just produced.
         const preProcessed = str.replace(/'/g, "&apos;");
+        // Decode all named/numeric HTML entities, then normalise non-breaking spaces (U+00A0 \u2014
+        // a common entity-decode result, e.g. from &nbsp;) down to ordinary spaces.
         return decodeHTML(preProcessed).replace(/\u00A0/g, " ");
     }
 
@@ -907,6 +1111,9 @@ export class Utils {
         let payload: object | string;
         let optionsJWT: unknown;
 
+        // `options` can be given two different ways — a raw JSON string for the JWT header
+        // (quoted literal, trimmed of surrounding quotes), or a partial options object (just
+        // pull its algorithm out, defaulting to HS256 if not given).
         if (typeof options === "string") {
             Log.writeLine(LogLevels.FrameworkDebug, `Options is a string: [${options}]`);
             optionsJWT = StringUtils.trimQuotes(options as string);
@@ -915,6 +1122,11 @@ export class Utils {
             optionsJWT = { algorithm: options?.algorithm ?? "HS256" };
         }
 
+        // The payload may be given as either a JSON string or an already-parsed object. If it
+        // looks like valid JSON (JSON5 allowed), parse a string form into a real object so
+        // jwtSign always receives a consistent object shape; a string payload that ISN'T JSON
+        // is logged as a (non-fatal) warning, since a test may genuinely intend a raw string
+        // payload, but it's worth flagging in case it's actually a typo.
         if (JsonUtils.isJson(payloadData, true)) {
             Log.writeLine(LogLevels.FrameworkDebug, `Payload is JSON [${typeof payloadData === "string" ? "string" : "object"}]`);
             payload = typeof payloadData === "string" ? JsonUtils.parse(payloadData, true) : payloadData;
@@ -923,14 +1135,23 @@ export class Utils {
             payload = payloadData;
         }
 
+        // Signatures/private keys are sometimes passed with literal "\\n" sequences (e.g. from
+        // an env var or a single-line config value) standing in for real newlines — normalise
+        // those back to actual newline characters before use (multi-line PEM keys need real
+        // newlines to parse correctly).
         const normalizedSignature = StringUtils.replaceAll(signature, '\\\\n', '\n');
         Log.writeLine(LogLevels.FrameworkDebug, `Signature: ${normalizedSignature}`);
 
+        // When options came in as a string, it's JWT header JSON that still needs parsing and
+        // wrapping in a `{ header: ... }` shape for jwtSign; when it came in as an object,
+        // optionsJWT is already the full sign-options object jwtSign expects directly.
         const jwtHeader = typeof options === "string" ? { header: JsonUtils.parse(optionsJWT as string, true) } : optionsJWT as object;
         Log.writeLine(LogLevels.FrameworkDebug, `JWT Sign options:\n${JSON.stringify(jwtHeader, null, 2)}`);
         try {
             return jwtSign(payload, normalizedSignature, jwtHeader);
         } catch (err) {
+            // Render the newlines back to a visible "<NEWLINE>" marker in the error message —
+            // a real embedded newline would otherwise make the logged error harder to read.
             const errText = `Error creating [${typeof options === 'string' ? options : JSON.stringify(options as object)}] JWT token from [${payloadData}] (signature: [${StringUtils.replaceAll(signature, '\\\\n', '<NEWLINE>')}]): ${Utils.errorMessage(err)}`;
             Log.logErrorAndThrow(errText);
         }
@@ -959,8 +1180,15 @@ export class Utils {
      */
     static getJWTPayload(jwtToken: string): object {
         try {
+            // { json: true } tells jwtDecode to parse the payload as JSON rather than return
+            // the raw decoded string.
             let payload = jwtDecode(jwtToken, { json: true });
+            // jwtDecode returns null for a token it can't decode at all — normalise that to an
+            // empty object so callers always get a real object back (or a thrown error, never null).
             payload = Utils.isNull(payload) ? {} : payload;
+            // The decoded payload should always be a JSON object — if jwtDecode somehow returned
+            // some other JSON type (a bare string/number/array), that's unexpected and worth
+            // failing on explicitly rather than returning a non-object silently.
             if (typeof payload !== "object") {
                 throw new Error(`Not an object. Is [${typeof payload}]. Expected JSON object.`);
             }
@@ -988,18 +1216,25 @@ export class Utils {
     static spawnBackgroundProcess(command: string, args: string[], { logStdout = false, logStderr = false, spawnOptions = undefined }: { logStdout?: boolean, logStderr?: boolean, spawnOptions?: SpawnOptionsWithoutStdio } = {}): ChildProcessWithoutNullStreams {
         Log.writeLine(LogLevels.TestInformation, `Executing: ${command} ${args.join(' ')}`);
         const childProcess = spawn(command, args, spawnOptions);
+        // Node sets pid to undefined if the spawn itself failed synchronously (e.g. command not
+        // found on some platforms) — treat that as fatal rather than returning a broken handle.
         if (childProcess?.pid === undefined) {
             const errText = `Unable to spawn [${command}] with args [${args.join(', ')}] and options [${spawnOptions === undefined ? '' : JSON.stringify(spawnOptions)}] — spawn returned undefined PID`;
             Log.logErrorAndThrow(errText);
         }
         Log.writeLine(LogLevels.TestInformation, `Started process: PID ${childProcess.pid}`);
 
+        // Only attach a stdout listener if the caller actually wants stdout logged — an
+        // unconsumed stdout stream otherwise just buffers quietly, so this is opt-in, not free.
         if (logStdout) {
             childProcess.stdout.on('data', (data) => {
                 Log.writeLine(LogLevels.TestInformation, `Background(stdout): ${data.toString()}`, { suppressAllPreamble: true });
             });
         }
         if (logStderr) {
+            // Mirror stdout handling for stderr, plus also listen for a process-level 'error'
+            // event (e.g. the child process failing to spawn asynchronously, or an IPC failure)
+            // — these are only surfaced when the caller cares about stderr/error-level output.
             childProcess.stderr.on('data', (data) => {
                 Log.writeLine(LogLevels.TestInformation, `Background(stderr): ${data.toString()}`, { suppressAllPreamble: true });
             });
@@ -1022,8 +1257,13 @@ export class Utils {
     static async spawnBackgroundProcessWithTimeout(command: string, args: string[], timeoutSeconds: number, { logStdout = false, logStderr = false, spawnOptions = undefined }: { logStdout?: boolean, logStderr?: boolean, spawnOptions?: SpawnOptionsWithoutStdio } = {}): Promise<number> {
         return new Promise((resolve) => {
             const child = Utils.spawnBackgroundProcess(command, args, { logStdout, logStderr, spawnOptions });
+            // Three different events (exit, error, timeout) could all try to resolve this
+            // promise — `exited` ensures only the first one to fire actually does anything,
+            // since a Promise can only settle once anyway but the cleanup logic (clearing the
+            // timeout, logging) still needs this guard to avoid running twice.
             let exited = false;
 
+            // Normal case — the process finished on its own before the timeout.
             child.on('exit', (code) => {
                 if (!exited) {
                     Log.writeLine(LogLevels.TestInformation, `Process [${child.pid ?? 'unknown'}] exited. Code: ${code ?? 'undefined!'}`);
@@ -1033,6 +1273,8 @@ export class Utils {
                 }
             });
 
+            // The process itself failed to run at all (not a normal non-zero exit code, but a
+            // spawn-level failure) — treat this as a -1 result, same as a timeout.
             child.on('error', (err) => {
                 if (!exited) {
                     Log.writeLine(LogLevels.Error, `Process [${child.pid ?? 'unknown'}] errored:\n${err ?? 'unknown error'}`);
@@ -1042,11 +1284,15 @@ export class Utils {
                 }
             });
 
+            // If the user Ctrl+C's the test runner itself, make sure the spawned child (and its
+            // own descendants) don't keep running as orphaned background processes.
             process.on('SIGINT', () => {
                 Log.writeLine(LogLevels.Error, `Caught SIGINT (Ctrl+C) — terminating child process [${child.pid ?? 'unknown'}]...`);
                 Utils.terminateBackgroundProcess(child, { signal: 'SIGINT' });
             });
 
+            // The process didn't exit (or error) within the allotted time — forcibly terminate
+            // it (and its descendants) and resolve with -1 to signal the timeout to the caller.
             const timeout = setTimeout(() => {
                 if (!exited) {
                     const errMessage = `Timeout — child process [${child.pid ?? 'unknown'}] did not exit within ${timeoutSeconds} seconds`;
@@ -1068,13 +1314,16 @@ export class Utils {
      */
     static async execCommand(command: string): Promise<string> {
         return new Promise((resolve, reject) => {
-            Log.writeLine(LogLevels.FrameworkInformation, `Exec command: >> ${command} <<`);
+            Log.writeLine(LogLevels.TestDebug, `Exec command: >> ${command} <<`);
             exec(command, (error, stdout, stderr) => {
+                // Treat either a genuine error OR any stderr output as a failure — a command
+                // writing to stderr (even with a zero exit code) is usually a sign something
+                // went wrong that the caller should see as a rejection, not a silent success.
                 if (error || stderr) {
-                    Log.writeLine(LogLevels.FrameworkDebug, `Error thrown so rejecting (${stderr ?? ''}): \n${error?.message ?? 'No error detail!'}`);
+                    Log.writeLine(LogLevels.TestDebug, `Error thrown so rejecting (${stderr ?? ''}): \n${error?.message ?? 'No error detail!'}`);
                     reject(error || stderr);
                 } else {
-                    Log.writeLine(LogLevels.FrameworkDebug, `Resolved: >> ${stdout ?? ''} <<`);
+                    Log.writeLine(LogLevels.TestDebug, `Resolved: >> ${stdout ?? ''} <<`);
                     resolve(stdout);
                 }
             });
@@ -1090,14 +1339,21 @@ export class Utils {
      */
     static isProcessRunning(pid: number): boolean {
         try {
+            // Signal 0 sends no actual signal — it's the standard POSIX trick for just checking
+            // whether a process exists/can be signalled, without affecting it.
             process.kill(pid, 0);
             return true;
         } catch (err) {
             if (err instanceof Error && typeof (err as NodeJS.ErrnoException).code === 'string') {
                 const error = err as NodeJS.ErrnoException;
+                // ESRCH — no such process; it genuinely isn't running.
                 if (error.code === 'ESRCH') return false;
+                // EPERM — the process exists but we lack permission to signal it (e.g. owned by
+                // another user) — it IS running, we just can't prove it via signalling.
                 if (error.code === 'EPERM')  return true;
             }
+            // Any other, unrecognised failure — don't guess; let it propagate so the caller
+            // sees the real underlying problem.
             throw err;
         }
     }
@@ -1140,22 +1396,30 @@ export class Utils {
     static async terminateBackgroundProcess(backgroundProcess: ChildProcessWithoutNullStreams, options: { signal?: string | number } = {}): Promise<boolean> {
         const signal = (options.signal ?? 'SIGKILL') as NodeJS.Signals;
 
+        // No process handle at all — nothing to do, and not an error (a caller may routinely
+        // call this on a process that was never started).
         if (Utils.isNullOrUndefined(backgroundProcess)) {
             Log.writeLine(LogLevels.TestInformation, `No background process executing — nothing to terminate`);
             return false;
         }
+        // A process handle exists but has no PID — this shouldn't normally happen (spawning
+        // already validates the PID), but guard against it rather than passing undefined to kill.
         if (Utils.isNullOrUndefined(backgroundProcess.pid)) {
             Log.writeLine(LogLevels.Error, `Background process has no PID — cannot terminate`);
             return false;
         }
 
         const processPid = backgroundProcess.pid!;
+        // Set up the "closed" listener BEFORE actually sending the kill signal below, so there's
+        // no race where the process closes before the listener is attached and the event is missed.
         const promise = new Promise<boolean>((resolve) => {
             backgroundProcess.on('close', (code, signal) => {
                 Log.writeLine(LogLevels.TestInformation, `Process [${processPid}] closed [Code: ${code ?? '<No Code>'}], Signal: ${signal ?? 'None'}`);
                 resolve(true);
             });
         });
+        // Now actually send the kill signal to the process and all its descendants, then wait
+        // for the 'close' event above to confirm it's actually gone before returning.
         await this.killProcessAndDescendants(processPid, signal);
         return promise;
     }
@@ -1191,12 +1455,17 @@ export class Utils {
         }
         const stdin = process.stdin;
 
+        // A non-TTY stdin (e.g. piped input, or a CI pipeline with no interactive terminal at
+        // all) has no keyboard to wait for — pausing here would hang forever, so detect that
+        // and return immediately instead, just logging that the pause was skipped.
         if (!stdin.isTTY) {
             Log.writeLine(LogLevels.Error, "Stdin is not a TTY — cannot pause for key press. Ignoring.");
             return;
         }
 
         return new Promise<void>((resolve) => {
+            // Shared teardown for once the key press has been seen — turn raw mode back off,
+            // re-pause stdin, and remove this specific listener so it doesn't linger.
             const cleanup = () => {
                 stdin.setRawMode(false);
                 stdin.pause();
@@ -1209,11 +1478,17 @@ export class Utils {
                 resolve();
             };
 
-            // Drain any buffered input before attaching the listener
+            // Drain any buffered input before attaching the listener — anything typed before
+            // this function was even called (e.g. buffered ahead of a slow test) must not
+            // immediately satisfy the pause, so resume reading, throw away whatever's sitting
+            // in the buffer, then pause again so the slate is clean.
             stdin.resume();
             while (stdin.read() !== null) { /* draining */ }
             stdin.pause();
 
+            // Attach a one-shot data listener (fires on the very next key press only), switch
+            // into raw mode (so a single keystroke is delivered immediately, without waiting
+            // for Enter/line-buffering), then resume reading to actually start listening.
             stdin.once("data", onData);
             stdin.setRawMode(true);
             stdin.resume();
@@ -1236,20 +1511,31 @@ export class Utils {
      * @throws {Error} If `timeoutMS` is negative.
      */
     static async timeoutPromise<T>(promise: Promise<T>, options: { timeoutMS?: number, friendlyName?: string } = {}): Promise<T> {
+        // Track this as an outstanding promise for the duration of the call — incremented here,
+        // decremented in the `finally` below regardless of whether it resolves, rejects, or times out.
         Utils._promiseCount++;
+        // If the caller didn't give a friendly name, try to infer the calling function's own
+        // name from the stack as a fallback, so timeout error messages are still identifiable.
         const operationName = options?.friendlyName ?? (this.inferCallerFunctionName() || "Unknown operation");
         try {
+            // No per-call timeout was given, and no workspace-wide default has been configured
+            // either — there's nothing to time out against, which is a configuration mistake
+            // worth failing on loudly rather than silently waiting forever.
             if (Utils.isNullOrUndefined(options?.timeoutMS) && Utils._defaultPromiseTimeout === 0) {
                 const errText = 'Utils.timeoutPromise: No timeout given and default not set (have you initialised the default timeout?)';
                 Log.logErrorAndThrow(errText);
             }
+            // Use the per-call timeout if given, otherwise fall back to the configured default.
             const actualTimeout = (Utils.isNullOrUndefined(options?.timeoutMS) ? Utils._defaultPromiseTimeout : options?.timeoutMS) as number;
             if (actualTimeout < 0) {
                 const errText = `Utils.timeoutPromise: Timeout cannot be negative. Was [${actualTimeout}]`;
                 Log.logErrorAndThrow(errText);
             }
+            // Delegate the actual race-against-a-timer logic to withTimeout.
             return this.withTimeout<T>(promise, { timeoutMS: actualTimeout, friendlyName: operationName });
         } finally {
+            // Always decrement, whatever happened above — keeps promiseCount accurate even on
+            // an early throw from the validation checks.
             Utils._promiseCount--;
         }
     }
@@ -1279,17 +1565,24 @@ export class Utils {
      * // => { action: "click", normalizedAction: "click", parameters: Map { "target" => "#btn", "force" => true } }
      */
     static splitActionAndParameters(rawAction: string): ActionAndParams {
+        // Split "actionName(param1: value1, ...)" into the bare verb and the raw text inside
+        // the parentheses — StringUtils owns the actual splitting logic.
         const actionAndParameters = StringUtils.splitVerbAndParameters(rawAction);
         const normalizedAction = actionAndParameters.verb.toLowerCase().trim();
 
         if (StringUtils.isBlank(actionAndParameters.parameters)) {
+            // No parentheses, or empty parentheses — no parameters to parse, return an empty map.
             return { action: actionAndParameters.verb, normalizedAction, parameters: new Map() };
         } else {
+            // Wrap the inner text back in braces to form a real JSON5 object literal, then
+            // validate and parse it that way, converting the resulting object's entries into a Map.
             const paramsJSON = "{" + actionAndParameters.parameters + "}";
             if (JsonUtils.isJson(paramsJSON, true)) {
                 const paramsMap = new Map(Object.entries(JsonUtils.parse(paramsJSON, true)));
                 return { action: actionAndParameters.verb, normalizedAction, parameters: paramsMap };
             } else {
+                // The parenthesised content isn't valid JSON5 once wrapped in braces — the
+                // action string itself is malformed, so fail loudly with the raw content shown.
                 const errText = `Invalid action [${actionAndParameters.verb}] parameter syntax. Expected (param1: <value>, param2: <value2>, ...). Got: (${actionAndParameters.parameters})`;
                 Log.logErrorAndThrow(errText);
             }
@@ -1307,8 +1600,12 @@ export class Utils {
      */
     static checkENUMValueExists(enumType: object, valueToCheck: string) {
         try {
+            // Object.values on a TS enum object returns every member's runtime value — just
+            // check whether the value under test is among them.
             return Object.values(enumType).includes(valueToCheck);
         } catch {
+            // enumType wasn't actually a usable object (e.g. null) — fail closed as "not found"
+            // rather than letting this throw.
             return false;
         }
     }
@@ -1323,27 +1620,46 @@ export class Utils {
      */
     private static serialiseFileData(data: string | object): string {
         if (typeof data === "string") {
+            // A string that happens to already be valid (strict) JSON is normalised by
+            // round-tripping it through parse/stringify (e.g. collapses formatting/whitespace
+            // differences); a string that ISN'T JSON is written out exactly as given.
             return JsonUtils.isJson(data) ? JSON.stringify(JSON.parse(data)) : data;
         }
+        // A real object — pretty-print it with 2-space indentation for a readable file.
         return JSON.stringify(data, null, 2);
     }
 
     private static async withTimeout<T>(promise: Promise<T>, options: { timeoutMS?: number, friendlyName?: string } = {}): Promise<T> {
-        return Promise.race([
-            promise,
-            new Promise<T>((_, reject) =>
-                setTimeout(
-                    () => reject(new Error(`${Utils.isNullOrUndefined(options?.friendlyName) ? 'T' : `${options?.friendlyName}: T`}imeout after ${options?.timeoutMS ?? '0'} ms`)),
-                    options?.timeoutMS ?? 0
-                )
-            ),
-        ]);
+        let timeoutHandle: NodeJS.Timeout;
+        // Build a second promise that does nothing but reject once timeoutMS elapses — this is
+        // the thing the real `promise` races against below. The friendlyName, if given, is
+        // prefixed onto the rejection message so a timeout error is actually traceable to the
+        // operation that caused it.
+        const timeoutPromise = new Promise<T>((_, reject) => {
+            timeoutHandle = setTimeout(
+                () => reject(new Error(`${Utils.isNullOrUndefined(options?.friendlyName) ? 'T' : `${options?.friendlyName}: T`}imeout after ${options?.timeoutMS ?? '0'} ms`)),
+                options?.timeoutMS ?? 0
+            );
+        });
+        // Whichever side of the race settles first, the other side's timer must still be
+        // cleared — otherwise a won-by-promise race leaves the losing setTimeout running for
+        // the full timeoutMS, holding the Node event loop open even though the real operation
+        // already finished (confirmed in production: a Cucumber-JS suite hanging ~30s after
+        // all scenarios passed, matching the default timeout exactly).
+        return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutHandle));
     }
 
     private static inferCallerFunctionName(): string | null {
+        // Creating an Error here (without throwing it) is purely a way to capture a stack
+        // trace at this exact point — split it into individual frame lines.
         const error = new Error();
         const stackLines = error.stack?.split("\n") || [];
+        // Frame 0 is "Error", frame 1 is this function itself (inferCallerFunctionName), frame
+        // 2 is whichever Utils method called it (e.g. timeoutPromise) — frame 3 is the actual
+        // caller of THAT, which is the function name we actually want to report.
         const callerLine = stackLines[3] || "";
+        // V8 stack frames look like "    at FunctionName (file:line:col)" — extract just the
+        // function name portion.
         const match = callerLine.match(/at (.+?) \(/);
         return match ? match[1] : null;
     }

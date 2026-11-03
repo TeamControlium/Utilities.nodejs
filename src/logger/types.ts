@@ -107,6 +107,21 @@ export interface WriteLineOptions {
   suppressElapsed?: boolean;
 
   /**
+   * When `true`, the level label (e.g. `TSINF`) is omitted from the preamble.
+   *
+   * Has no effect when {@link suppressAllPreamble} is `true`.
+   */
+  suppressLevel?: boolean;
+
+  /**
+   * When `true`, the call-site label (the `[MethodName (file:line:col)]` segment)
+   * is omitted from the preamble.
+   *
+   * Has no effect when {@link suppressAllPreamble} is `true`.
+   */
+  suppressSource?: boolean;
+
+  /**
    * Format string for the wall-clock timestamp, using date-fns syntax.
    *
    * Has no effect when {@link suppressTimeStamp} or {@link suppressAllPreamble}

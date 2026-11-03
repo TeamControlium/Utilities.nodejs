@@ -99,8 +99,12 @@ export class Mock {
    * Mock.delegateMode = true;
    */
   static set delegateMode(value: boolean) {
+    // value must actually be a boolean — fail fast and clearly if not.
     Utils.assertType(value, 'boolean', 'delegateMode', 'value');
-    Log.writeLine(LogLevels.FrameworkInformation, `Mock: delegate mode ${value ? 'enabled' : 'disabled'}`);
+    // Record the mode change in the log before applying it, so the log shows exactly when
+    // (and to what) delegate mode changed.
+    Log.writeLine(LogLevels.TestInformation, `Mock: delegate mode ${value ? 'enabled' : 'disabled'}`);
+    // Store the new mode on the private backing field.
     Mock._delegateMode = value;
   }
 
@@ -157,15 +161,28 @@ export class Mock {
    * );
    */
   static addListener(name: string, matchers: string[], action: Mock.ListenerAction, delayMs = 0): void {
+
+    ////////////////////////////////////////////////////
+    //
+    // Validates every argument up front (name, matchers, action, delayMs) — throwing on the
+    // first problem found rather than registering a half-valid listener — then logs and
+    // stores the listener, replacing any existing one with the same name.
+
+    // name must be a non-empty string.
     Utils.assertType(name, 'string', 'addListener', 'name');
     if (name.trim().length === 0) Mock.throwError('addListener', '[name] must not be empty');
 
+    // matchers must be a non-empty array.
     if (!Array.isArray(matchers)) {
       Mock.throwError('addListener', `[matchers] must be a string array, got [${typeof matchers}]`);
     }
     if (matchers.length === 0) {
       Mock.throwError('addListener', '[matchers] array must not be empty');
     }
+    // Check every matcher individually: must be a non-empty string, and must be syntactically
+    // valid JSONPath — validated here, at registration time, by actually running it against an
+    // empty object, so a malformed expression throws immediately rather than silently failing
+    // (or always "not matching") every time a request is later intercepted.
     matchers.forEach((matcher, index) => {
       if (typeof matcher !== 'string') {
         Mock.throwError('addListener', `[matchers[${index}]] must be a string, got [${typeof matcher}]`);
@@ -180,38 +197,55 @@ export class Mock {
       }
     });
 
+    // action is either one of the two literal strings 'block'/'passthrough' (nothing further
+    // to validate), or it must be a genuine Mock.Response object — validate that shape here.
     if (action !== 'block' && action !== 'passthrough') {
+      // Must be a plain, non-null, non-array object to even be a candidate Response.
       if (action === null || typeof action !== 'object' || Array.isArray(action)) {
         Mock.throwError('addListener', `[action] must be 'block', 'passthrough', or a Mock.Response object, got [${action === null ? 'null' : typeof action}]`);
       }
       const response = action as Mock.Response;
+      // status must be a valid HTTP status code.
       if (typeof response.status !== 'number' || !Number.isInteger(response.status) || response.status < 100 || response.status > 599) {
         Mock.throwError('addListener', `[action.status] must be a valid HTTP status code (100-599), got [${response.status}]`);
       }
+      // headers, if given at all, must be a plain object (not null, not an array).
       if (response.headers !== undefined && (typeof response.headers !== 'object' || response.headers === null || Array.isArray(response.headers))) {
         Mock.throwError('addListener', `[action.headers] must be a plain object if provided`);
       }
+      // statusText wasn't supplied by the caller — default it from Node's own HTTP status-code
+      // table. '_undefined' is a deliberate escape hatch letting a caller force statusText to
+      // actually be undefined (rather than defaulted), since plain `undefined` can't be
+      // distinguished from "not supplied" once it's sitting on the object.
       if (Utils.isUndefined(action.statusText))
         action.statusText = STATUS_CODES[action.status] ?? undefined;
       else if (action.statusText === '_undefined') action.statusText = undefined;
     }
 
+    // delayMs must be a non-negative finite number.
     Utils.assertType(delayMs, 'number', 'addListener', 'delayMs');
     if (!Number.isFinite(delayMs) || delayMs < 0) {
       Mock.throwError('addListener', `[delayMs] must be a non-negative finite number, got [${delayMs}]`);
     }
 
+    // Warn (but don't fail) if this name already has a listener registered — it's about to be
+    // silently replaced below.
     if (Mock.listeners.has(name)) {
       Log.writeLine(LogLevels.Warning, `Mock.addListener: replacing existing listener <${name}>`);
     }
 
+    // Build a human-readable description of the action for the log line below: the two literal
+    // actions get a short label, while an actual Response object gets pretty-printed in full.
     const isBlockOrPassthrough = action === 'block' || action === 'passthrough';
     const actionText = (() => {
       if (action === 'block') return 'Block';
       if (action === 'passthrough') return 'Passthrough';
       return JSON.stringify(action, null, 2);
     })();
-    Log.writeLine(LogLevels.FrameworkInformation, `Add mock listener <${name}${delayMs > 0 ? ` (Delay by ${delayMs}mS)` : ''}>:\nMatcher: ${matchers.join('\nMatcher: ')}\nAction:${isBlockOrPassthrough ? ` ${actionText}` : `\n${actionText}`}`, { suppressMultilinePreamble: true });
+    // Log the full listener registration — name, delay (if any), every matcher, and the
+    // resolved action — before actually storing it.
+    Log.writeLine(LogLevels.TestInformation, `Add mock listener <${name}${delayMs > 0 ? ` (Delay by ${delayMs}mS)` : ''}>:\nMatcher: ${matchers.join('\nMatcher: ')}\nAction:${isBlockOrPassthrough ? ` ${actionText}` : `\n${actionText}`}`, { suppressMultilinePreamble: true });
+    // Store (or replace) the listener, keyed by name.
     Mock.listeners.set(name, { name, matchers, action, delayMs });
   }
 
@@ -228,13 +262,16 @@ export class Mock {
    * Mock.removeListener('get-users');
    */
   static removeListener(name: string): void {
+    // name must be a non-empty string.
     Utils.assertType(name, 'string', 'removeListener', 'name');
     if (name.trim().length === 0) Mock.throwError('removeListener', '[name] must not be empty');
+    // No listener registered under this name — warn and return without touching anything.
     if (!Mock.listeners.has(name)) {
       Log.writeLine(LogLevels.Warning, `Mock.removeListener: no listener named <${name}> exists — nothing removed`);
       return;
     }
-    Log.writeLine(LogLevels.FrameworkInformation, `Mock: Remove listener <${name}>`);
+    // Listener exists — log the removal, then actually delete it.
+    Log.writeLine(LogLevels.TestInformation, `Mock: Remove listener <${name}>`);
     Mock.listeners.delete(name);
   }
 
@@ -245,7 +282,7 @@ export class Mock {
    * {@link Mock.reset} to clear everything in a single call.
    */
   static clearListeners(): void {
-    Log.writeLine(LogLevels.FrameworkInformation, `Mock: Clear all listeners (${Mock.listeners.size} removed)`);
+    Log.writeLine(LogLevels.TestInformation, `Mock: Clear all listeners (${Mock.listeners.size} removed)`);
     Mock.listeners.clear();
   }
 
@@ -289,46 +326,70 @@ export class Mock {
    * }
    */
   static async processInterceptedRequest(interceptedRequest: Mock.Request): Promise<Mock.InterceptResult> {
+
+    ////////////////////////////////////////////////////
+    //
+    // Validates the intercepted request, finds the first listener (if any) whose matchers all
+    // match it, then dispatches on that listener's action — block / passthrough (local or
+    // delegate mode) / mocked response — applying any configured delay, recording the outcome
+    // as a transaction, and returning the InterceptResult the caller should act on. No listener
+    // matching is itself a result (default-deny): it's recorded and blocked exactly like an
+    // explicit 'block' action.
+
+    // request must be a non-null, non-array object.
     if (interceptedRequest === null || interceptedRequest === undefined || typeof interceptedRequest !== 'object' || Array.isArray(interceptedRequest)) {
       Mock.throwError('intercept', `[request] must be a non-null object, got [${interceptedRequest === null ? 'null' : typeof interceptedRequest}]`);
     }
+    // request.url must be a non-empty string.
     if (typeof interceptedRequest.url !== 'string' || interceptedRequest.url.trim().length === 0) {
       Mock.throwError('intercept', `[request.url] must be a non-empty string, got [${typeof interceptedRequest.url}]`);
     }
+    // request.method must be a non-empty string.
     if (typeof interceptedRequest.method !== 'string' || interceptedRequest.method.trim().length === 0) {
       Mock.throwError('intercept', `[request.method] must be a non-empty string, got [${typeof interceptedRequest.method}]`);
     }
+    // request.headers, if given at all, must be a plain object.
     if (interceptedRequest.headers !== undefined && interceptedRequest.headers !== null && (typeof interceptedRequest.headers !== 'object' || Array.isArray(interceptedRequest.headers))) {
       Mock.throwError('intercept', `[request.headers] must be a plain object if provided`);
     }
 
-    Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: ${interceptedRequest.method} ${interceptedRequest.url}`);
+    Log.writeLine(LogLevels.TestDebug, `Mock.intercept: ${interceptedRequest.method} ${interceptedRequest.url}`);
 
+    // Find the first registered listener (in registration order) whose every matcher matches
+    // this request.
     const listener = Mock.findMatch(interceptedRequest);
 
+    // No listener matched — default-deny: record as unmatched and block.
     if (!listener) {
-      Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: no listener matched — blocking`);
+      Log.writeLine(LogLevels.TestInformation, `Mock.intercept: no listener matched — blocking`);
       Mock.record({ type: 'unmatched', request: interceptedRequest });
       return { action: 'block' };
     }
 
-    Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: matched listener <${listener.name}>`);
+    Log.writeLine(LogLevels.TestDebug, `Mock.intercept: matched listener <${listener.name}>`);
 
+    // Apply the listener's configured delay (if any) before doing anything else — this
+    // simulates network latency regardless of which action branch runs next.
     if (listener.delayMs > 0) {
-      Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: delaying ${listener.delayMs}ms`);
+      Log.writeLine(LogLevels.TestDebug, `Mock.intercept: delaying ${listener.delayMs}ms`);
       await Utils.sleep(listener.delayMs);
     }
 
+    // Listener explicitly blocks — record as blocked and abort.
     if (listener.action === 'block') {
-      Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: blocking request`);
+      Log.writeLine(LogLevels.TestInformation, `Mock.intercept: blocking request`);
       Mock.record({ type: 'blocked', listenerName: listener.name, request: interceptedRequest });
       return { action: 'block' };
     }
 
+    // Listener wants the request forwarded to the real endpoint.
     if (listener.action === 'passthrough') {
       if (Mock._delegateMode) {
+        // Delegate mode — Mock itself doesn't fetch the real response; it hands back a
+        // correlationId and stashes a pending transaction, to be completed later by the
+        // caller via completePassthrough once it has fetched the real response itself.
         const correlationId = randomUUID();
-        Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: delegating passthrough (correlationId: ${correlationId})`);
+        Log.writeLine(LogLevels.TestInformation, `Mock.intercept: delegating passthrough (correlationId: ${correlationId})`);
         Mock.pendingTransactions.set(correlationId, {
           correlationId,
           timestamp: new Date(),
@@ -337,14 +398,18 @@ export class Mock {
         });
         return { action: 'passthrough', correlationId };
       }
-      Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: passing through to real endpoint`);
+      // Local mode — Mock fetches the real response itself, records the full transaction
+      // immediately, and returns it ready to fulfil.
+      Log.writeLine(LogLevels.TestInformation, `Mock.intercept: passing through to real endpoint`);
       const response = await Mock.fetchReal(interceptedRequest);
       Mock.record({ type: 'passthrough', listenerName: listener.name, request: interceptedRequest, response });
       return { action: 'fulfill', response };
     }
 
+    // Remaining case: the listener's action is a literal Mock.Response object — return it
+    // directly as a mocked response, without touching the network.
     const response = listener.action as Mock.Response;
-    Log.writeLine(LogLevels.FrameworkDebug, `Mock.intercept: returning mocked response (status ${response.status})`);
+    Log.writeLine(LogLevels.TestInformation, `Mock.intercept: returning mocked response (status ${response.status})`);
     Mock.record({ type: 'mocked', listenerName: listener.name, request: interceptedRequest, response });
     return { action: 'fulfill', response };
   }
@@ -374,26 +439,35 @@ export class Mock {
    * }
    */
   static completePassthrough(correlationId: string, response: Mock.Response): void {
+    // correlationId must be a non-empty string.
     Utils.assertType(correlationId, 'string', 'completePassthrough', 'correlationId');
     if (correlationId.trim().length === 0) {
       Mock.throwError('completePassthrough', '[correlationId] must not be empty');
     }
+    // It must actually correspond to a passthrough still awaiting completion — not unknown,
+    // not already completed, not cleared by a reset() in between.
     if (!Mock.pendingTransactions.has(correlationId)) {
       Mock.throwError('completePassthrough', `[correlationId] "${correlationId}" does not match any pending passthrough — it may be unknown, already completed, or cleared by reset()`);
     }
 
+    // response must be a non-null, non-array object.
     if (response === null || response === undefined || typeof response !== 'object' || Array.isArray(response)) {
       Mock.throwError('completePassthrough', `[response] must be a non-null object, got [${response === null ? 'null' : typeof response}]`);
     }
+    // response.status must be a valid HTTP status code.
     if (typeof response.status !== 'number' || !Number.isInteger(response.status) || response.status < 100 || response.status > 599) {
       Mock.throwError('completePassthrough', `[response.status] must be a valid HTTP status code (100-599), got [${response.status}]`);
     }
+    // response.headers, if given at all, must be a plain object.
     if (response.headers !== undefined && (typeof response.headers !== 'object' || response.headers === null || Array.isArray(response.headers))) {
       Mock.throwError('completePassthrough', `[response.headers] must be a plain object if provided`);
     }
 
+    // Look up the pending transaction's original request/listener details (stashed when the
+    // passthrough was first delegated), log completion, remove it from the pending set, then
+    // record it as a completed passthrough transaction alongside everything else.
     const pending = Mock.pendingTransactions.get(correlationId)!;
-    Log.writeLine(LogLevels.FrameworkDebug, `Mock.completePassthrough: completing passthrough for correlationId ${correlationId} (status ${response.status})`);
+    Log.writeLine(LogLevels.TestInformation, `Mock.completePassthrough: completing passthrough for correlationId ${correlationId} (status ${response.status})`);
     Mock.pendingTransactions.delete(correlationId);
     Mock.record({ type: 'passthrough', listenerName: pending.listenerName, request: pending.request, response });
   }
@@ -423,7 +497,10 @@ export class Mock {
    * Use {@link Mock.reset} to clear everything in a single call.
    */
   static clearTransactions(): void {
-    Log.writeLine(LogLevels.FrameworkInformation, `Mock: Clear transaction history (${Mock.transactions.length} removed)`);
+    // Log how many transactions are about to be discarded before actually clearing them.
+    Log.writeLine(LogLevels.TestInformation, `Mock: Clear transaction history (${Mock.transactions.length} removed)`);
+    // Empty the transaction list and reset the id counter so the next transaction starts
+    // again from 'txn-1'.
     Mock.transactions = [];
     Mock.transactionCounter = 0;
   }
@@ -463,11 +540,16 @@ export class Mock {
    * });
    */
   static reset(): void {
-    Log.writeLine(LogLevels.FrameworkInformation, `Mock: Reset (${Mock.listeners.size} listeners, ${Mock.transactions.length} transactions, ${Mock.pendingTransactions.size} pending cleared)`);
+    // Log the counts of everything about to be cleared before actually clearing any of it.
+    Log.writeLine(LogLevels.TestInformation, `Mock: Reset (${Mock.listeners.size} listeners, ${Mock.transactions.length} transactions, ${Mock.pendingTransactions.size} pending cleared)`);
+    // Clear registered listeners.
     Mock.listeners.clear();
+    // Clear completed transaction history and reset its id counter.
     Mock.transactions = [];
     Mock.transactionCounter = 0;
+    // Clear any passthroughs still awaiting completion.
     Mock.pendingTransactions.clear();
+    // Reset delegate mode back to its default (local mode).
     Mock._delegateMode = false;
   }
 
@@ -479,13 +561,27 @@ export class Mock {
   }
 
   private static findMatch(request: Mock.Request): Mock.Listener | undefined {
+
+    ////////////////////////////////////////////////////
+    //
+    // Walks every registered listener in registration order, returning the first one whose
+    // every matcher matches the request (AND logic across matchers). A JSONPath evaluation
+    // error on a single matcher — or any other unexpected error while evaluating a whole
+    // listener — is treated as a non-match for that matcher/listener rather than aborting the
+    // whole search, so one bad listener can't stop every other listener from being considered.
+
     Logger.writeLine(LogLevels.FrameworkInformation, `Checking if any listeners for [${request.url} (${request.method})]`);
     for (const listener of Mock.listeners.values()) {
       try {
+        // A listener matches only if every one of its matchers matches (AND, not OR).
         const allMatch = listener.matchers.every((matcher) => {
           try {
+            // Log the request being tested, for diagnostic visibility.
             const x = JSON.stringify(request, null, 2);
             Logger.writeLine(LogLevels.TestInformation, x);
+            // Wrap the request in a single-element array since JsonUtils' JSONPath matching
+            // expects an array-shaped root to query against; a non-zero match count means
+            // this matcher matched.
             const matched = JsonUtils.getMatchingJSONPropertyCount([request] as unknown as object, matcher) > 0;
             if (matched) {
               Logger.writeLine(LogLevels.FrameworkDebug, `Matched on [${matcher}]`);
@@ -493,41 +589,66 @@ export class Mock {
             }
             return false;
           } catch (e) {
+            // A single matcher throwing (e.g. a runtime JSONPath evaluation error) doesn't
+            // abort the listener — treat it as that matcher simply not matching.
             Log.writeLine(LogLevels.Warning, `Mock: JSONPath evaluation error in listener <${listener.name}> for path "${matcher}": ${Utils.errorMessage(e)} — treating as non-match`);
             return false;
           }
         });
 
+        // All matchers matched — this listener wins; stop searching and return it.
         if (allMatch) return listener;
         else {
           Logger.writeLine(LogLevels.FrameworkDebug, 'No matches');
         }
       } catch (e) {
+        // Something unexpected went wrong evaluating this listener as a whole — log it and
+        // move on to the next listener rather than letting one bad listener abort the search.
         Log.writeLine(LogLevels.Warning, `Mock: Unexpected error evaluating listener <${listener.name}>: ${Utils.errorMessage(e)} — skipping`);
       }
     }
+    // No listener matched.
     return undefined;
   }
 
   private static async fetchReal(request: Mock.Request): Promise<Mock.Response> {
-    Log.writeLine(LogLevels.FrameworkDebug, `Mock.fetchReal: ${request.method} ${request.url}`);
+
+    ////////////////////////////////////////////////////
+    //
+    // Performs the actual real-network fetch for a local-mode passthrough, converting the
+    // response into a Mock.Response shape. Any network-level failure (DNS, connection refused,
+    // timeout, etc.) is caught and turned into a synthetic 502 response rather than letting the
+    // exception propagate — a passthrough failure should surface to the test as a bad response,
+    // not as an unhandled rejection crashing the interceptor.
+
+    Log.writeLine(LogLevels.TestDebug, `Mock.fetchReal: ${request.method} ${request.url}`);
     try {
+      // Issue the real request, serialising a non-null body to JSON (fetch itself doesn't do
+      // this automatically).
       const response = await fetch(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body != null ? JSON.stringify(request.body) : undefined,
       });
 
+      // Read the response body as text first, then opportunistically try to parse it as JSON
+      // — falling back to the raw text if it isn't valid JSON, since a response body isn't
+      // guaranteed to be JSON at all.
       const body = await response.text().then((text) => {
         try { return JSON.parse(text); } catch { return text; }
       });
 
+      // Flatten the Headers object into a plain key/value record, matching Mock.Response's
+      // shape.
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => { headers[key] = value; });
 
-      Log.writeLine(LogLevels.FrameworkDebug, `Mock.fetchReal: received ${response.status} from ${request.url}`);
+      Log.writeLine(LogLevels.TestDebug, `Mock.fetchReal: received ${response.status} from ${request.url}`);
       return { status: response.status, headers, body };
     } catch (e) {
+      // The fetch itself failed (not an HTTP error status — an actual network-level failure)
+      // — report it as a synthetic 502 Bad Gateway response rather than throwing, so the
+      // caller still gets a well-formed Mock.Response to work with.
       const message = Utils.errorMessage(e);
       Log.writeLine(LogLevels.Error, `Mock.fetchReal: network error fetching ${request.url}: ${message}`);
       return { status: 502, headers: {}, body: `Mock passthrough network error: ${message}` };

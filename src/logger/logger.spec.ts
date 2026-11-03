@@ -61,6 +61,45 @@ describe("Logger", () => {
       expect(typeof opts.maxLines).toBe("number");
     });
 
+    describe("maxLines", () => {
+
+      const originalMaxLines = Logger.maxLines;
+
+      afterEach(() => {
+        Logger.maxLines = originalMaxLines;
+      });
+
+      it("round-trips correctly", () => {
+        Logger.maxLines = 200;
+        expect(Logger.maxLines).toBe(200);
+      });
+
+      it("is reflected by writeLineOptions too — same underlying value", () => {
+        Logger.maxLines = 123;
+        expect(Logger.writeLineOptions.maxLines).toBe(123);
+      });
+
+      it("a call's own options.maxLines still overrides this default", () => {
+        Logger.maxLines = 200;
+        const lines: string[] = [];
+        Logger.logOutputCallback = (text) => lines.push(text);
+        Logger.loggingLevel = Logger.Levels.FrameworkDebug;
+        Logger.writeLine(Logger.Levels.FrameworkDebug, Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n"), { maxLines: 5 });
+        Logger.clearOutputCallback();
+        // 5 max: first 3 real lines + a "skipping" notice + the last line.
+        expect(lines.length).toBe(5);
+      });
+
+      it("rejects a value below 3, matching writeLine's own per-call validation", () => {
+        expect(() => { Logger.maxLines = 2; }).toThrow(/maxLines must be 3 or greater/);
+      });
+
+      it("rejects a non-number value", () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect(() => { Logger.maxLines = "200" as any; }).toThrow();
+      });
+    });
+
     it("clearOutputCallback sets callback to undefined", () => {
       Logger.logOutputCallback = () => { };
       expect(Logger.logOutputCallback).toBeDefined();
@@ -430,6 +469,67 @@ describe("Logger", () => {
       expect(logOutput).toHaveLength(1);
       expect(logOutput[0]).not.toMatch(/\[\d{2}:\d{2}:\d{2}\]/);
       expect(logOutput[0]).not.toMatch(/\[00:00\.\d{3}\]/);
+    });
+
+    it("suppressLevel omits the level label from the preamble", () => {
+      Logger.loggingLevel = Logger.Levels.Error;
+      Logger.writeLine(Logger.Levels.Error, "no level", {
+        suppressLevel: true,
+      });
+
+      expect(logOutput).toHaveLength(1);
+      expect(logOutput[0]).not.toMatch(/ERR/);
+      // Timestamp/elapsed/source are unaffected
+      expect(logOutput[0]).toMatch(/\[\d{2}:\d{2}:\d{2}\]/);
+      expect(logOutput[0]).toMatch(/\[.*logger\.spec\.ts:\d{1,3}:\d{1,2}\]/);
+    });
+
+    it("suppressSource omits the call-site label from the preamble, with no stray separator", () => {
+      Logger.loggingLevel = Logger.Levels.Error;
+      Logger.writeLine(Logger.Levels.Error, "no source", {
+        suppressSource: true,
+      });
+
+      expect(logOutput).toHaveLength(1);
+      expect(logOutput[0]).not.toMatch(/logger\.spec\.ts/);
+      // Elapsed bracket is immediately followed by ": " — no leftover space/bracket.
+      expect(logOutput[0]).toMatch(/\[00:00\.\d{3}\]: no source/);
+    });
+
+    it("suppressLevel, suppressSource, suppressTimeStamp, and suppressElapsed combine to leave only \" - : \"", () => {
+      Logger.loggingLevel = Logger.Levels.Error;
+      Logger.writeLine(Logger.Levels.Error, "bare", {
+        suppressLevel: true,
+        suppressSource: true,
+        suppressTimeStamp: true,
+        suppressElapsed: true,
+      });
+
+      expect(logOutput).toHaveLength(1);
+      expect(logOutput[0]).toMatch(/\[ - : bare\]$/);
+    });
+
+    it("suppressAllPreamble takes precedence over suppressLevel/suppressSource too", () => {
+      Logger.loggingLevel = Logger.Levels.Error;
+      Logger.writeLine(Logger.Levels.Error, "fully bare", {
+        suppressAllPreamble: true,
+        suppressLevel: false,
+        suppressSource: false,
+      });
+
+      expect(logOutput).toHaveLength(1);
+      expect(logOutput[0]).toMatch(/\[fully bare\]$/);
+    });
+
+    it("a global suppressRealTime-equivalent (Logger-wide suppressTimeStamp) combines with a per-call suppressSource", () => {
+      Logger.loggingLevel = Logger.Levels.Error;
+      Logger.writeLineOptions.suppressTimeStamp = true;
+      Logger.writeLine(Logger.Levels.Error, "mixed scope", { suppressSource: true });
+
+      expect(logOutput).toHaveLength(1);
+      expect(logOutput[0]).not.toMatch(/\[\d{2}:\d{2}:\d{2}\]/);
+      expect(logOutput[0]).not.toMatch(/logger\.spec\.ts/);
+      expect(logOutput[0]).toMatch(/\[00:00\.\d{3}\]: mixed scope/);
     });
 
     describe("level filtering", () => {

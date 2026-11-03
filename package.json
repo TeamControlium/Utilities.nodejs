@@ -7,10 +7,10 @@
   "contributors": [
     "Mat Walker <v-mwalk@alexview.com>"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TeamControlium/controlium-utils"
+    "url": "https://github.com/TeamControlium/utils"
   },
   "engines": {
     "node": ">=22"
@@ -30,6 +30,10 @@
     "clean": "rm -rf dist coverage",
     "build:esm": "tsc -p tsconfig.build.json",
     "build": "npm run clean && npm run build:esm",
+    "build:esm:debug": "tsc -p tsconfig.build.debug.json",
+    "build:debug": "npm run clean && npm run build:esm:debug",
+    "build:esm:debug:watch": "tsc -p tsconfig.build.debug.json --watch",
+    "build:debug:watch": "npm run clean && npm run build:esm:debug:watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:debug": "vitest run --reporter=verbose mock.spec",
@@ -51,13 +55,18 @@
     "date-fns": "^4.1.0",
     "date-fns-tz": "^3.2.0",
     "entities": "^6.0.1",
+    "fast-xml-parser": "^5.11.2",
+    "fontoxpath": "^3.34.0",
     "json5": "^2.2.3",
     "jsonpath-plus": "^10.3.0",
     "jsonpointer": "^5.0.1",
     "jsonwebtoken": "^9.0.2",
     "picomatch": "^4.0.7",
+    "slimdom": "^4.3.5",
     "tree-kill": "^1.2.2",
-    "undici": "^8.1.0"
+    "undici": "^8.1.0",
+    "xml-formatter": "^3.7.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@semantic-release/changelog": "^6.0.0",
@@ -74,7 +83,8 @@
     "eslint": "^8.0.0",
     "semantic-release": "^25.0.9",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "yalc": "^1.0.0-pre.53"
   },
   "publishConfig": {
     "access": "public"
