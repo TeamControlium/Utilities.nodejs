@@ -9,7 +9,7 @@ import { Log, Utils } from "../index.js";
  * nothing from the underlying `yaml` package's own `Document`/comment-preserving mutation
  * API (`parseDocument`, `visit`, etc.). Nothing calls into that yet — DataTable-based
  * path modifications against a YAML base aren't wired up anywhere in the ecosystem yet
- * (`cucumber-driver`'s own file-sourced YAML body step is still an unimplemented stub); when
+ * (`cucumber`'s own file-sourced YAML body step is still an unimplemented stub); when
  * that gets built, *that* is the point to reach for `Document` instead of extending this,
  * since a naive parse → mutate plain object → re-stringify round trip silently destroys any
  * comments/blank-lines/formatting a test author put in a YAML fixture file, which
