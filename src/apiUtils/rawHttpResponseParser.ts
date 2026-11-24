@@ -184,7 +184,10 @@ export class RawHttpResponseParser {
       if (name === "content-length") {
         // Only accept a genuine non-negative integer — anything else (empty, negative,
         // non-numeric) is treated as if the header were absent, not as an error.
-        const parsed = Number(value);
+        // Note: Number('') is 0, not NaN — the same JS gotcha already called out in
+        // ValueExpression.applyCast's 'number' case — so an empty value has to be rejected
+        // explicitly, before it's mistaken for a valid "Content-Length: 0".
+        const parsed = value === "" ? NaN : Number(value);
         contentLength = Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
       } else if (name === "transfer-encoding" && value.toLowerCase().includes("chunked")) {
         // Case-insensitive substring match — real servers may list "chunked" alongside
@@ -217,9 +220,11 @@ export class RawHttpResponseParser {
    * no trailing newline is ambiguous (more characters for it may simply not have arrived
    * yet), never a "complete" line. */
   private static completeLines(text: string): string[] {
-    // Find the start of the last line terminator, whichever kind (CRLF or bare LF) appears
-    // last in the text — everything after it is a trailing, not-yet-terminated line.
-    const lastNewlineIdx = Math.max(text.lastIndexOf("\r\n"), text.lastIndexOf("\n"));
+    // Find the last "\n" in the text. This also finds the "\n" half of any "\r\n" pair,
+    // since that's the same character — so a single search already covers both line-ending
+    // styles; a separate "\r\n" search could never find a later position than this one does,
+    // because its own terminating "\n" is the character this search is already looking for.
+    const lastNewlineIdx = text.lastIndexOf("\n");
     // No terminator at all → nothing is a complete line yet. Otherwise, drop everything
     // from that last terminator onward (the ambiguous trailing partial line).
     const complete = lastNewlineIdx === -1 ? "" : text.slice(0, lastNewlineIdx);

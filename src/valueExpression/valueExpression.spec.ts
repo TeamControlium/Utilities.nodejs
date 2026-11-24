@@ -1,17 +1,9 @@
-import { Detokeniser } from "../detokeniser/detokeniser.js";
 import { Utils } from "../utils/utils.js";
 import { isCastVerb, ValueExpression } from "./valueExpression.js";
-
-// A known-safe token — resolves via a default rather than a real env var, so these tests
-// never depend on anything actually being set in the environment. Same convention already
-// used by detokeniser.spec.ts.
-const TOKEN = (fallback: string) =>
-  `[[setting|processEnvName: "VALUE_EXPRESSION_SPEC_DEFINITELY_NOT_SET_XYZ", defaultValue: "${fallback}"]]`;
 
 describe("ValueExpression.parse", () => {
 
   afterEach(() => {
-    Detokeniser.reset();
     vi.restoreAllMocks();
   });
 
@@ -29,10 +21,6 @@ describe("ValueExpression.parse", () => {
     await expect(ValueExpression.parse("http://example.com")).resolves.toBe("http://example.com");
   });
 
-  it("detokenises even the plain literal case", async () => {
-    await expect(ValueExpression.parse(`Bearer ${TOKEN("abc123")}`)).resolves.toBe("Bearer abc123");
-  });
-
   // ─── number: ──────────────────────────────────────────────────────────────
 
   it("number: casts to a finite number", async () => {
@@ -41,10 +29,6 @@ describe("ValueExpression.parse", () => {
 
   it("number: trims surrounding whitespace before parsing", async () => {
     await expect(ValueExpression.parse("number: 42 ")).resolves.toBe(42);
-  });
-
-  it("number: detokenises the argument before casting", async () => {
-    await expect(ValueExpression.parse(`number:${TOKEN("42")}`)).resolves.toBe(42);
   });
 
   it("number: rejects an empty value (not 0 — Number('') is a known JS gotcha)", async () => {
@@ -133,16 +117,6 @@ describe("ValueExpression.parse", () => {
       await expect(ValueExpression.parse("file,json:payload.json", { useJson5: true })).resolves.toEqual({ a: 1 });
     });
 
-    it("detokenises the path before resolving it", async () => {
-      vi.spyOn(Utils, "getFileContents").mockReturnValue("content");
-      await ValueExpression.parse(`file:${TOKEN("resolved-name.txt")}`);
-      expect(Utils.resolveTestDataPath).toHaveBeenCalledWith("resolved-name.txt");
-    });
-
-    it("detokenises the loaded content separately from the path — two independent passes", async () => {
-      vi.spyOn(Utils, "getFileContents").mockReturnValue(TOKEN("content-value"));
-      await expect(ValueExpression.parse("file:xyzzy.txt")).resolves.toBe("content-value");
-    });
   });
 
   // ─── Verb-combination validation ──────────────────────────────────────────

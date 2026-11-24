@@ -1,10 +1,8 @@
-import { LogLevel } from "../index.js";
-import { Utils, SettingResult, SettingsContext } from "../index.js";
+import { LogLevel, Utils, SettingResult, SettingsContext } from "../index.js";
 
 /**
  * Thin, test-runner-agnostic layer on top of {@link Utils.getSetting}. Remembers the
  * "current" {@link SettingsContext} (e.g. a Cucumber World) so callers elsewhere — code that
- * never received the World directly, bootstrapping logic, `Detokeniser.doSettingToken`,
  * anything — can still resolve a `profileParameterName`-sourced setting without needing it
  * threaded through explicitly.
  *
@@ -34,51 +32,59 @@ import { Utils, SettingResult, SettingsContext } from "../index.js";
  * });
  */
 export class Settings {
-    private static _current: SettingsContext | undefined = undefined;
+  // The context passed to the last setContext() call — or undefined if setContext was never
+  // called, or clearContext() was called since. get() reads this every time rather than
+  // caching any resolved value, so it's always the single source of truth for "what context,
+  // if any, should profileParameterName resolve against right now."
+  private static _current: SettingsContext | undefined = undefined;
 
-    /**
-     * Sets the context used to resolve `profileParameterName` in subsequent {@link get} calls,
-     * until the next {@link setContext} or {@link clearContext}.
-     *
-     * @param contextParameters - The context to use (e.g. `{ sourceName: "World", parameters: this }`
-     *   from a Cucumber `Before` hook). Pass `undefined` to clear it (equivalent to {@link clearContext}).
-     */
-    public static setContext(contextParameters?: SettingsContext): void {
-        Settings._current = contextParameters;
-    }
+  /**
+   * Sets the context used to resolve `profileParameterName` in subsequent {@link get} calls,
+   * until the next {@link setContext} or {@link clearContext}.
+   *
+   * @param contextParameters - The context to use (e.g. `{ sourceName: "World", parameters: this }`
+   *   from a Cucumber `Before` hook). Pass `undefined` to clear it (equivalent to {@link clearContext}).
+   */
+  public static setContext(contextParameters?: SettingsContext): void {
+    Settings._current = contextParameters;
+  }
 
-    /**
-     * Clears the current context — equivalent to `setContext(undefined)`. Subsequent
-     * {@link get} calls with a `profileParameterName` will find no context to resolve it
-     * against (falling back to `defaultValue`, same as {@link Utils.getSetting} always does
-     * when no context is available).
-     */
-    public static clearContext(): void {
-        Settings._current = undefined;
-    }
+  /**
+   * Clears the current context — equivalent to `setContext(undefined)`. Subsequent
+   * {@link get} calls with a `profileParameterName` will find no context to resolve it
+   * against (falling back to `defaultValue`, same as {@link Utils.getSetting} always does
+   * when no context is available).
+   */
+  public static clearContext(): void {
+    Settings._current = undefined;
+  }
 
-    /**
-     * Resolves a named setting via {@link Utils.getSetting}, using whatever {@link SettingsContext}
-     * was last set via {@link setContext} (or none, if never set/cleared). Never caches the
-     * result — every call re-resolves from scratch, so an env var set between calls (already
-     * the highest-precedence source) takes effect immediately.
-     *
-     * @param logLevel - Log level used when reporting where the setting was found.
-     * @param settingName - Human-readable name for the setting, used in log messages.
-     * @param sources - Same shape as {@link Utils.getSetting}'s `sources` parameter.
-     * @returns `{ value, source }` — see {@link Utils.getSetting}.
-     */
-    public static get<returnType>(
-        logLevel: LogLevel,
-        settingName: string,
-        sources: {
-            processEnvName?: string | undefined;
-            npmPackageConfigName?: string | undefined;
-            profileParameterName?: string | undefined;
-            defaultValue?: returnType | undefined;
-            notFoundIsExpected?: boolean;
-        },
-    ): SettingResult<returnType> {
-        return Utils.getSetting(logLevel, settingName, sources, Settings._current);
-    }
+  /**
+   * Resolves a named setting via {@link Utils.getSetting}, using whatever {@link SettingsContext}
+   * was last set via {@link setContext} (or none, if never set/cleared). Never caches the
+   * result — every call re-resolves from scratch, so an env var set between calls (already
+   * the highest-precedence source) takes effect immediately.
+   *
+   * @param logLevel - Log level used when reporting where the setting was found.
+   * @param settingName - Human-readable name for the setting, used in log messages.
+   * @param sources - Same shape as {@link Utils.getSetting}'s `sources` parameter.
+   * @returns `{ value, source }` — see {@link Utils.getSetting}.
+   */
+  public static get<TValue>(
+    logLevel: LogLevel,
+    settingName: string,
+    sources: {
+      processEnvName?: string | undefined;
+      npmPackageConfigName?: string | undefined;
+      profileParameterName?: string | undefined;
+      defaultValue?: TValue | undefined;
+      notFoundIsExpected?: boolean;
+    },
+  ): SettingResult<TValue> {
+    // Delegate straight to Utils.getSetting, just supplying whatever context setContext()
+    // last recorded (or undefined, if none has been set) — this class adds no resolution
+    // logic of its own, only the "remember the context so callers don't have to" behaviour
+    // described in the class doc comment above.
+    return Utils.getSetting(logLevel, settingName, sources, Settings._current);
+  }
 }

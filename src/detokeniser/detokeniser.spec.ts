@@ -1,5 +1,6 @@
 import { addDays, addMonths, addYears, format } from "date-fns";
 
+import { Log, LogLevels, StringUtils } from "../index.js";
 import { Detokeniser } from "./detokeniser.js";
 
 describe("Detokeniser", () => {
@@ -32,6 +33,203 @@ describe("Detokeniser", () => {
     });
   });
 
+  // ─── delimiter ────────────────────────────────────────────────────────────────
+
+  describe("delimiter", () => {
+    it("is '|' by default", () => {
+      expect(Detokeniser.delimiter).toBe("|");
+    });
+
+    it("accepts every character on the allow-list", async () => {
+      for (const char of [" ", "|", ";", ":", "~", "^", "!", "?", "&"]) {
+        Detokeniser.delimiter = char;
+        expect(Detokeniser.delimiter).toBe(char);
+      }
+    });
+
+    it("rejects a character outside the allow-list, with a clear error naming the allowed set", () => {
+      expect(() => (Detokeniser.delimiter = ",")).toThrow(/not an allowed delimiter character/);
+      expect(() => (Detokeniser.delimiter = ",")).toThrow(/<space>, \|, ;, :, ~, \^, !, \?, &/);
+    });
+
+    it("rejects every character that is already structurally significant elsewhere in the grammar", () => {
+      for (const char of ["[", "]", "(", ")", "/", ",", "'", '"']) {
+        expect(() => (Detokeniser.delimiter = char)).toThrow(/not an allowed delimiter character/);
+      }
+    });
+
+    it("rejects a letter or digit, even though neither breaks the grammar", () => {
+      expect(() => (Detokeniser.delimiter = "b")).toThrow(/not an allowed delimiter character/);
+      expect(() => (Detokeniser.delimiter = "5")).toThrow(/not an allowed delimiter character/);
+    });
+
+    it("rejects a multi-character string, even if every character in it is individually allowed", () => {
+      expect(() => (Detokeniser.delimiter = ";;")).toThrow(/not an allowed delimiter character/);
+    });
+
+    it("rejects a non-string value", () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(() => (Detokeniser.delimiter = 42 as any)).toThrow();
+    });
+
+    it("leaves the previous, still-valid delimiter in place after a rejected assignment", () => {
+      Detokeniser.delimiter = ";";
+      expect(() => (Detokeniser.delimiter = "(")).toThrow();
+      expect(Detokeniser.delimiter).toBe(";");
+    });
+
+    it("reset() restores delimiter to '|'", () => {
+      Detokeniser.delimiter = ";";
+      Detokeniser.reset();
+      expect(Detokeniser.delimiter).toBe("|");
+    });
+
+    it("a built-in verb splits its own args on the current delimiter, not a hardcoded '|'", async () => {
+      Detokeniser.delimiter = ";";
+      await expect(Detokeniser.doAsync("[[random;digits;4]]")).resolves.toMatch(/^\d{4}$/);
+      await expect(Detokeniser.doAsync("[[date;today;yyyy]]")).resolves.toBe(format(new Date(), "yyyy"));
+      await expect(Detokeniser.doAsync("[[base64;encode;Hello World]]")).resolves.toBe("SGVsbG8gV29ybGQ=");
+      await expect(Detokeniser.doAsync("[[diff;UTC;UTC]]")).resolves.toBe("0");
+    });
+
+    it("the previous delimiter ('|') is no longer treated specially once changed — it's just a literal character to a built-in that now splits on ';'", async () => {
+      Detokeniser.delimiter = ";";
+      // base64-encoding a value that itself contains a literal '|' — no quoting needed now,
+      // since '|' is no longer the separator.
+      await expect(Detokeniser.doAsync("[[base64;encode;a|b]]")).resolves.toBe(Buffer.from("a|b").toString("base64"));
+    });
+
+    it("a token-shaped qualifier form (verb(qualifier)|args) still parses correctly against a non-default delimiter", async () => {
+      Detokeniser.delimiter = ";";
+      Detokeniser.addCallback("mytype", ({ qualifier }) => (qualifier === "special" ? "SPECIAL" : undefined));
+      await expect(Detokeniser.doAsync("[[mytype(special);today;yyyy]]")).resolves.toBe("SPECIAL");
+    });
+
+    it("a user-registered callback's context carries the current delimiter, not a stale default", async () => {
+      Detokeniser.delimiter = "~";
+      let captured: string | undefined;
+      Detokeniser.addCallback("echo", ({ delimiter }) => {
+        captured = delimiter;
+        return "ok";
+      });
+      await Detokeniser.doAsync("[[echo~a]]");
+      expect(captured).toBe("~");
+    });
+
+    it("space is a valid, if unusual, delimiter choice", async () => {
+      Detokeniser.delimiter = " ";
+      await expect(Detokeniser.doAsync("[[random digits 4]]")).resolves.toMatch(/^\d{4}$/);
+    });
+  });
+
+  // ─── Debug logging ────────────────────────────────────────────────────────────
+
+  describe("debug logging", () => {
+    beforeEach(() => {
+      Log.loggingLevel = LogLevels.TestDebug;
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("logs one 'Processed [token] to [result]' line for a single resolved token", async () => {
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      const result = await Detokeniser.doAsync("Ref-[[random|digits|4]]");
+
+      const call = writeLineSpy.mock.calls.find(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).startsWith("Processed [[[random|digits|4]]]")
+      );
+      expect(call).toBeDefined();
+      expect(call?.[1]).toBe(`Processed [[[random|digits|4]]] to [${result.replace("Ref-", "")}]`);
+    });
+
+    it("logs one line per token, innermost first, for a nested token", async () => {
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await Detokeniser.doAsync("[[date|addDays([[random|digits|1]])|dd-MM-yyyy]]");
+
+      const processedCalls = writeLineSpy.mock.calls.filter(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).startsWith("Processed [")
+      );
+      expect(processedCalls.length).toBe(2);
+      // The inner [[random|...]] token resolves (and is logged) before the outer [[date|...]]
+      // token, which can only resolve once the inner one's result has been spliced in.
+      expect(processedCalls[0][1]).toContain("[[random|digits|1]]");
+      expect(processedCalls[1][1]).toContain("[[date|addDays(");
+    });
+
+    it("truncates the raw token and the result independently, at 64 characters each", async () => {
+      Detokeniser.addCallback("echo", ({ args }) => args);
+      const longArg = "y".repeat(100);
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await Detokeniser.doAsync(`[[echo|${longArg}]]`);
+
+      const call = writeLineSpy.mock.calls.find(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).startsWith("Processed [")
+      );
+      expect(call).toBeDefined();
+      const rawToken = `[[echo|${longArg}]]`;
+      expect(call?.[1]).toBe(
+        `Processed [${StringUtils.truncateIfNeeded(rawToken, 64)}] to [${StringUtils.truncateIfNeeded(longArg, 64)}]`
+      );
+    });
+
+    it("logs nothing per-token on failure — only the existing error-level log applies", async () => {
+      // "random" IS a recognised verb — this fails inside its own dispatch (an unrecognised
+      // sub-verb), not via UnsupportedTokenError, so it still genuinely throws rather than
+      // falling back to literal text (see the "unsupported verb" tests below for that case).
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await expect(Detokeniser.doAsync("[[random|bogus_mode|5]]")).rejects.toThrow();
+
+      const processedCall = writeLineSpy.mock.calls.find(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).startsWith("Processed [")
+      );
+      expect(processedCall).toBeUndefined();
+      const errorCall = writeLineSpy.mock.calls.find(([level]) => level === LogLevels.Error);
+      expect(errorCall).toBeDefined();
+    });
+
+    it("logs a single truncated 'no tokens found' line when the string contains no [[ at all", async () => {
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await Detokeniser.doAsync("plain text, nothing to resolve here");
+
+      const call = writeLineSpy.mock.calls.find(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).startsWith("Processed [")
+      );
+      expect(call).toBeDefined();
+      expect(call?.[1]).toBe("Processed [plain text, nothing to resolve here], no tokens found");
+    });
+
+    it("truncates the 'no tokens found' line's raw string at 48 characters", async () => {
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      const longPlainText = "x".repeat(200);
+      await Detokeniser.doAsync(longPlainText);
+
+      const call = writeLineSpy.mock.calls.find(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).startsWith("Processed [")
+      );
+      expect(call).toBeDefined();
+      expect(call?.[1]).toBe(`Processed [${StringUtils.truncateIfNeeded(longPlainText, 48)}], no tokens found`);
+    });
+
+    it("never logs 'no tokens found' for a string that does contain a token", async () => {
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await Detokeniser.doAsync("Ref-[[random|digits|4]]");
+
+      const noTokenCall = writeLineSpy.mock.calls.find(
+        ([level, message]) => level === LogLevels.TestDebug && (message as string).endsWith("no tokens found")
+      );
+      expect(noTokenCall).toBeUndefined();
+    });
+
+    it("logs nothing when disabled", async () => {
+      Detokeniser.enabled = false;
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await Detokeniser.doAsync("Ref-[[random|digits|4]]");
+      expect(writeLineSpy).not.toHaveBeenCalled();
+    });
+  });
+
   // ─── Basic string manipulation ───────────────────────────────────────────────
 
   describe("Basic string manipulation with no tokens", () => {
@@ -51,9 +249,26 @@ describe("Detokeniser", () => {
       await expect(Detokeniser.doAsync("No token ]]here")).resolves.toStrictEqual("No token ]]here");
     });
 
-    it("string with unknown token throws", async () => {
-      await expect(Detokeniser.doAsync("[[unknown]]")).rejects.toThrow(
-        "Error processing [[[unknown]]]: Unsupported token [unknown]"
+    it("string with unknown verb falls back to literal text, not an error, and logs a Warning", async () => {
+      // Deliberate trade-off (see UnsupportedTokenError's own doc comment): an unrecognised
+      // verb is indistinguishable, from here, between a genuine typo and incidental [[/]]
+      // adjacency in unrelated literal data (e.g. a JSON nested array) — resolved in favour
+      // of treating it as literal text, logged at Warning rather than silently.
+      const writeLineSpy = vi.spyOn(Log, "writeLine");
+      await expect(Detokeniser.doAsync("[[unknown]]")).resolves.toStrictEqual("[[unknown]]");
+      const warningCall = writeLineSpy.mock.calls.find(([level]) => level === LogLevels.Warning);
+      expect(warningCall).toBeDefined();
+      expect(warningCall?.[1]).toContain("[[unknown]]");
+    });
+
+    it("a JSON nested array — incidental [[/]] adjacency with no verb involved at all — passes through unchanged", async () => {
+      const body = `{"data":[[1,2],[3,4]]}`;
+      await expect(Detokeniser.doAsync(body)).resolves.toStrictEqual(body);
+    });
+
+    it("a JSON nested array alongside a genuine, unrelated token — both resolve correctly in the same string", async () => {
+      await expect(Detokeniser.doAsync('{"id":"[[random|digits|4]]","data":[[1,2],[3,4]]}')).resolves.toMatch(
+        /^\{"id":"\d{4}","data":\[\[1,2\],\[3,4\]\]\}$/
       );
     });
 
@@ -112,6 +327,81 @@ describe("Detokeniser", () => {
     it("from - with escaped token opener inside paren content", async () => {
       // /[[ inside from() is a literal [[ — result chars should include [
       await expect(Detokeniser.doAsync("[[random|from(ab/[[)|3]]")).resolves.toMatch(/^[ab[]{3}$/);
+    });
+
+    it("from - quoted string list, single quotes, picks one whole item", async () => {
+      await expect(Detokeniser.doAsync("[[random|from('cat','dog')|3]]")).resolves.toMatch(/^(cat|dog)$/);
+    });
+
+    it("from - quoted string list, mixed single and double quotes per item", async () => {
+      await expect(Detokeniser.doAsync("[[random|from('cat',\"dog\")|3]]")).resolves.toMatch(/^(cat|dog)$/);
+    });
+
+    it("from - quoted string list, incidental whitespace tolerated around comma and before first item", async () => {
+      await expect(Detokeniser.doAsync("[[random|from( 'cat' , 'dog' )|3]]")).resolves.toMatch(/^(cat|dog)$/);
+    });
+
+    it("from - quoted string list, escaped same-type quote inside an item", async () => {
+      // Cap set to exactly the item's own length (6) — any larger would leave budget for the
+      // fill loop to continue, truncating a second copy of this single-item pool onto the end.
+      await expect(Detokeniser.doAsync("[[random|from('he/'llo')|6]]")).resolves.toBe("he'llo");
+    });
+
+    it("from - quoted string list, opposite quote type inside an item needs no escaping", async () => {
+      await expect(Detokeniser.doAsync('[[random|from("he\'llo")|6]]')).resolves.toBe("he'llo");
+    });
+
+    it("from - quoted string list, literal ')' inside an item doesn't end the call early", async () => {
+      await expect(Detokeniser.doAsync("[[random|from('he)llo')|6]]")).resolves.toBe("he)llo");
+    });
+
+    it("from - quoted string list, <length> is a maximum total, filled exactly by truncating an overshooting draw", async () => {
+      // Drawing '1234567' (7 chars) first truncates to its first 5 characters ("12345"),
+      // same as drawing '12345' whole. Drawing '123' first (3 chars) leaves a remaining
+      // budget of 2 — every item in this pool starts with "12", so whatever's drawn next
+      // contributes "12" regardless, giving "12312". Either way, the 5-character cap is
+      // always used up fully, never left short and never "" (see buildFromStringListResult's
+      // own doc comment for why a too-long draw is truncated rather than discarded).
+      await expect(Detokeniser.doAsync("[[random|from('1234567','123','12345')|5]]")).resolves.toMatch(/^(12345|12312)$/);
+    });
+
+    it("from - quoted string list, cap shorter than every item truncates instead of resolving to empty", async () => {
+      await expect(Detokeniser.doAsync("[[random|from('true','false')|3]]")).resolves.toMatch(/^(tru|fal)$/);
+    });
+
+    it("from - quoted string list, an empty item stops the fill loop rather than looping forever", async () => {
+      // Drawing '' first (or second, after 'bye') stops the loop immediately, since an empty
+      // item can never reduce the remaining budget — 'bye' can also be truncated to fill the
+      // rest of the cap if drawn a second time.
+      await expect(Detokeniser.doAsync("[[random|from('','bye')|5]]")).resolves.toMatch(/^(|bye|byeby)$/);
+    });
+
+    it("from - trailing content after a validly-closed call throws, naming the real cause instead of 'invalid length'", async () => {
+      // 'he')llo') — the FIRST unescaped ' after 'he closes a complete, valid one-item list,
+      // from('he'), with its own matching ')' right after. "llo')|5" trails that close paren
+      // without the delimiter immediately following it, so this is never a length/format
+      // argument — the author most likely forgot to escape an embedded quote inside the item
+      // they meant to write, but whatever the cause, this throws naming it as trailing
+      // content, not as an invalid length (which would misdescribe the actual problem).
+      await expect(Detokeniser.doAsync("[[random|from('he')llo')|5]]")).rejects.toThrow(
+        /Trailing content after a from\(\.\.\.\)\/float\(\.\.\.\)\/date\(\.\.\.\) call.*found: \[llo'\)\|5\]/
+      );
+    });
+
+    it("from - character-pool mode still requires an explicit length, unchanged", async () => {
+      await expect(Detokeniser.doAsync("[[random|from(abcd)]]")).rejects.toThrow(/Invalid length part/);
+    });
+
+    it("from - quoted string list, omitted length picks exactly one whole item, uncapped", async () => {
+      await expect(Detokeniser.doAsync("[[random|from('cat','dog')]]")).resolves.toMatch(/^(cat|dog)$/);
+    });
+
+    it("from - quoted string list, omitted length is never truncated even for a long item", async () => {
+      await expect(Detokeniser.doAsync("[[random|from('1234567')]]")).resolves.toBe("1234567");
+    });
+
+    it("named set (not from(...)) still requires an explicit length, unchanged", async () => {
+      await expect(Detokeniser.doAsync("[[random|digits]]")).rejects.toThrow(/Invalid length part/);
     });
 
     it("digits - 1 character", async () => {
@@ -257,6 +547,11 @@ describe("Detokeniser", () => {
       const result = await Detokeniser.doAsync("[[date|addDays([[random|digits|1]])|yyyy-MM-dd]]");
       expect(result).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     });
+
+    it("date-fns literal-text quoting in the format argument is unaffected — the leading ' is date-fns' own escape syntax, not this redesign's quote-aware splitting, which this verb deliberately excludes", async () => {
+      const result = await Detokeniser.doAsync("[[date|today|'T'HH:mm]]");
+      expect(result).toBe(format(new Date(), "'T'HH:mm"));
+    });
   });
 
   // ─── timezone token ───────────────────────────────────────────────────────────
@@ -302,6 +597,10 @@ describe("Detokeniser", () => {
 
     it("invalid zone name throws a clear error", async () => {
       await expect(Detokeniser.doAsync("[[diff|UTC|Nowhere/Fake]]")).rejects.toThrow(/not a recognised IANA timezone/);
+    });
+
+    it("the first zone can be quoted — no real zone name needs this, but proves the quote-aware wiring", async () => {
+      await expect(Detokeniser.doAsync("[[diff|'Pacific/Kiritimati'|UTC]]")).resolves.toBe("14");
     });
   });
 
@@ -365,6 +664,12 @@ describe("Detokeniser", () => {
       expect(result).toBeDefined();
       expect(result.split(".").length).toBe(3);
     });
+
+    it("a quoted payload can carry a literal pipe character the JSON value itself needs", async () => {
+      const result = await Detokeniser.doAsync(`[[jwt|'{"sub":"a|b"}'|MySecret]]`);
+      const decodedPayload = JSON.parse(Buffer.from(result.split(".")[1], "base64url").toString());
+      expect(decodedPayload.sub).toBe("a|b");
+    });
   });
 
   // ─── Setting token ───────────────────────────────────────────────────────────
@@ -417,72 +722,158 @@ describe("Detokeniser", () => {
       Detokeniser.resetCallbacks();
     });
 
-    it("sync callback receives full token body and its return value is used", async () => {
-      let capturedToken: string | undefined;
-      Detokeniser.addCallback((token: string) => {
-        capturedToken = token;
+    it("sync callback receives parsed args and its return value is used", async () => {
+      let capturedArgs: string | undefined;
+      Detokeniser.addCallback("mytoken", ({ args }) => {
+        capturedArgs = args;
         return "syncResult";
       });
-      const result = await Detokeniser.doAsync("[[mytoken]]");
-      expect(capturedToken).toBe("mytoken");
+      const result = await Detokeniser.doAsync("[[mytoken|arg1|arg2]]");
+      expect(capturedArgs).toBe("arg1|arg2");
       expect(result).toBe("syncResult");
     });
 
-    it("sync callback receives token with multiple pipe-separated parts", async () => {
-      let capturedToken: string | undefined;
-      Detokeniser.addCallback((token: string) => {
-        capturedToken = token;
+    it("verb matching is case-insensitive and trimmed", async () => {
+      Detokeniser.addCallback("MyToken", () => "ok");
+      await expect(Detokeniser.doAsync("[[ mytoken ]]")).resolves.toBe("ok");
+    });
+
+    it("context carries verb, rawVerb, qualifier and args", async () => {
+      let captured: Detokeniser.CallbackContext | undefined;
+      Detokeniser.addCallback("mytype", (context) => {
+        captured = context;
         return "ok";
       });
-      await Detokeniser.doAsync("[[mytype|arg1|arg2]]");
-      expect(capturedToken).toBe("mytype|arg1|arg2");
+      await Detokeniser.doAsync("[[mytype(q)|arg1|arg2]]");
+      expect(captured).toEqual({
+        verb: "mytype",
+        rawVerb: "mytype(q)",
+        qualifier: "q",
+        args: "arg1|arg2",
+        delimiter: "|",
+        options: {},
+      });
     });
 
-    it("first callback returning undefined passes to second", async () => {
-      Detokeniser.addCallback((token: string) => (token === "first" ? "one" : undefined));
-      Detokeniser.addCallback((token: string) => (token === "second" ? "two" : undefined));
-      await expect(Detokeniser.doAsync("[[first]]")).resolves.toBe("one");
-      await expect(Detokeniser.doAsync("[[second]]")).resolves.toBe("two");
+    it("a callback declining (returning undefined) for its own verb falls back to literal text — no other handler is registered for it", async () => {
+      Detokeniser.addCallback("anything", () => undefined);
+      await expect(Detokeniser.doAsync("[[anything]]")).resolves.toStrictEqual("[[anything]]");
     });
 
-    it("all callbacks returning undefined throws unsupported token", async () => {
-      Detokeniser.addCallback(() => undefined);
-      await expect(Detokeniser.doAsync("[[anything]]")).rejects.toThrow("Unsupported token");
-    });
-
-    it("async callback receives full token body and its return value is used", async () => {
-      let capturedToken: string | undefined;
-      Detokeniser.addCallback(async (token: string) => {
-        capturedToken = token;
+    it("async callback receives parsed args and its return value is used", async () => {
+      let capturedArgs: string | undefined;
+      Detokeniser.addCallback("asynctoken", async ({ args }) => {
+        capturedArgs = args;
         return "asyncResult";
       });
-      const result = await Detokeniser.doAsync("[[asynctoken]]");
-      expect(capturedToken).toBe("asynctoken");
+      const result = await Detokeniser.doAsync("[[asynctoken|arg1|arg2]]");
+      expect(capturedArgs).toBe("arg1|arg2");
       expect(result).toBe("asyncResult");
     });
 
-    it("async callback receives token with multiple pipe-separated parts", async () => {
-      let capturedToken: string | undefined;
-      Detokeniser.addCallback(async (token: string) => {
-        capturedToken = token;
-        return "ok";
-      });
-      await Detokeniser.doAsync("[[asynctype|arg1|arg2]]");
-      expect(capturedToken).toBe("asynctype|arg1|arg2");
-    });
-
     it("resetCallbacks clears all callbacks", async () => {
-      Detokeniser.addCallback(() => "sync");
-      Detokeniser.addCallback(async () => "async");
+      Detokeniser.addCallback("anything", () => "sync");
       Detokeniser.resetCallbacks();
-      await expect(Detokeniser.doAsync("[[anything]]")).rejects.toThrow("Unsupported token");
+      await expect(Detokeniser.doAsync("[[anything]]")).resolves.toStrictEqual("[[anything]]");
     });
 
     it("reset clears all callbacks", async () => {
-      Detokeniser.addCallback(() => "sync");
-      Detokeniser.addCallback(async () => "async");
+      Detokeniser.addCallback("anything", () => "sync");
       Detokeniser.reset();
-      await expect(Detokeniser.doAsync("[[anything]]")).rejects.toThrow("Unsupported token");
+      await expect(Detokeniser.doAsync("[[anything]]")).resolves.toStrictEqual("[[anything]]");
+    });
+
+    it("a callback registered for a built-in verb name overrides the built-in", async () => {
+      Detokeniser.addCallback("date", () => "OVERRIDDEN");
+      await expect(Detokeniser.doAsync("[[date|today|yyyy]]")).resolves.toBe("OVERRIDDEN");
+    });
+
+    it("among several callbacks registered for the same verb, the most recently registered one wins", async () => {
+      Detokeniser.addCallback("date", () => "FIRST");
+      Detokeniser.addCallback("date", () => "SECOND");
+      await expect(Detokeniser.doAsync("[[date|today|yyyy]]")).resolves.toBe("SECOND");
+    });
+
+    it("a callback can decline (return undefined) and fall through to another callback for the same verb, then to the built-in", async () => {
+      Detokeniser.addCallback("date", ({ qualifier }) => (qualifier === "special" ? "SPECIAL" : undefined));
+      await expect(Detokeniser.doAsync("[[date(special)|today|yyyy]]")).resolves.toBe("SPECIAL");
+      // No qualifier at all — the registered callback declines, falls through to the built-in.
+      const result = await Detokeniser.doAsync("[[date|today|yyyy]]");
+      expect(result).toBe(format(new Date(), "yyyy"));
+    });
+
+    it("resetCallbacks removes an override and restores the built-in — built-ins live in a separate, never-reset list", async () => {
+      Detokeniser.addCallback("date", () => "OVERRIDDEN");
+      Detokeniser.resetCallbacks();
+      const result = await Detokeniser.doAsync("[[date|today|yyyy]]");
+      expect(result).toBe(format(new Date(), "yyyy"));
+    });
+
+    it("a callback receives the same DoOptions the caller passed to doAsync, including contextParameters", async () => {
+      let captured: Record<string, unknown> | undefined;
+      Detokeniser.addCallback("anything", ({ options }) => {
+        captured = options.contextParameters;
+        return "ok";
+      });
+      await Detokeniser.doAsync("[[anything]]", { contextParameters: { foo: "bar" } });
+      expect(captured).toEqual({ foo: "bar" });
+    });
+
+    it("a verb qualifier is extracted — first unescaped ')' ends it, no nesting", async () => {
+      let capturedQualifier: string | undefined;
+      Detokeniser.addCallback("someverb", ({ qualifier }) => {
+        capturedQualifier = qualifier;
+        return "ok";
+      });
+      await Detokeniser.doAsync("[[someverb(ddd(sd)|arg1|arg2]]");
+      expect(capturedQualifier).toBe("ddd(sd");
+    });
+
+    it("an unterminated verb qualifier throws a clear error", async () => {
+      Detokeniser.addCallback("someverb", () => "ok");
+      await expect(Detokeniser.doAsync("[[someverb(unterminated|arg]]")).rejects.toThrow(/Unterminated/);
+    });
+  });
+
+  // ─── Structural parsing (stack-based boundary scanning) ────────────────────────
+  //
+  // Coverage for the single-pass, stack-based rewrite of the token-boundary scanner — see
+  // utils/docs/design/detokeniser-structural-parsing-redesign.md for the full design. The
+  // prior design found a token's boundaries by locating the first [[/]] pair and splicing the
+  // resolved value back into the surrounding text for a fresh re-scan — meaning a verb's own
+  // resolved output (not just literal, test-author-written text) was itself re-examined for
+  // [[/]] syntax, with no way to tell the two apart. These tests exercise exactly that case:
+  // a verb whose output can, by chance, contain the raw characters [[ or ]].
+
+  describe("Structural parsing — resolved output never re-interpreted as token syntax", () => {
+    it("a verb producing literal ]] or [[ in its own output never corrupts a later sibling token, across many random draws", async () => {
+      Detokeniser.delimiter = ";";
+      // random|from([])|2 draws two characters from a pool of exactly "[" and "]" — across
+      // enough draws this hits every one of "[[", "]]", "[]", "][" at least once, including
+      // the two dangerous cases that look like real token boundaries.
+      for (let i = 0; i < 200; i++) {
+        const result = await Detokeniser.doAsync("before [[random;from([]);2]] after [[date;today;yyyy]]");
+        expect(result).toMatch(/^before (\[\[|\]\]|\[\]|\]\[) after \d{4}$/);
+      }
+    });
+
+    it("nesting and multiple sibling tokens in the same string both resolve correctly together", async () => {
+      Detokeniser.delimiter = ";";
+      const result = await Detokeniser.doAsync(
+        "Order [[random;digits;4]] placed on [[date;today;yyyy-MM-dd]], ships by " +
+        "[[date;addDays([[random;digits;1]]);dd-MM-yyyy]], ref [[random;uppercaseletters;3]]"
+      );
+      expect(result).toMatch(/^Order \d{4} placed on \d{4}-\d{2}-\d{2}, ships by \d{2}-\d{2}-\d{4}, ref [A-Z]{3}$/);
+    });
+
+    it("a [[ never closed by a matching ]] anywhere in the string is tolerated as literal text, not an error — unchanged from the prior design", async () => {
+      const result = await Detokeniser.doAsync("before [[unclosed and [[random|digits|2]] after");
+      expect(result).toMatch(/^before \[\[unclosed and \d{2} after$/);
+    });
+
+    it("a stray ]] with no open [[ to close is literal text, and — unlike the prior design — does not prevent a later, well-formed sibling token from resolving", async () => {
+      const result = await Detokeniser.doAsync("]] [[random|digits|3]]");
+      expect(result).toMatch(/^\]\] \d{3}$/);
     });
   });
 });

@@ -268,6 +268,16 @@ describe("JsonUtils.updateJSONObject", () => {
       const result = JsonUtils.updateJSONObject({ items: [1, 2, 3] }, "$.items[1]", JsonUtils.SENTINEL_UNDEFINED);
       expect(result).toEqual({ items: [1, 3] });
     });
+
+    it("deletes a property whose own name contains a '/' (JSON Pointer escapes this as '~1')", () => {
+      const result = JsonUtils.updateJSONObject({ "a/b": 1, c: 2 }, "$['a/b']", JsonUtils.SENTINEL_UNDEFINED);
+      expect(result).toEqual({ c: 2 });
+    });
+
+    it("deletes a property whose own name contains a '~' (JSON Pointer escapes this as '~0')", () => {
+      const result = JsonUtils.updateJSONObject({ "a~b": 1, c: 2 }, "$['a~b']", JsonUtils.SENTINEL_UNDEFINED);
+      expect(result).toEqual({ c: 2 });
+    });
   });
 });
 

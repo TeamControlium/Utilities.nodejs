@@ -1,4 +1,3 @@
-import { Detokeniser } from "../detokeniser/detokeniser.js";
 import { JsonUtils, Log, Utils } from "../index.js";
 
 const SOURCE_VERB = "file";
@@ -23,9 +22,10 @@ export function isCastVerb(verb: string): verb is CastVerb {
 }
 
 /**
- * Parses a single "value expression" string — the convention for a Cucumber DataTable
- * cell's `Value` column (and, later, anywhere else a tabular/textual source needs typed
- * values, not just headers) — into its resolved, correctly-typed value.
+ * Parses a single "value expression" string — the convention this package uses anywhere a
+ * tabular/textual source needs typed values from plain text (a table cell's `Value` column,
+ * a header value, anywhere else with the same need) — into its resolved, correctly-typed
+ * value.
  *
  * Two independent choices, composed with a comma, both appearing — always — before a
  * single colon, with the actual argument (inline text, or a file path) coming once, after
@@ -47,19 +47,9 @@ export function isCastVerb(verb: string): verb is CastVerb {
  * avoid surprising a test author with a silent wrong-type coercion.
  *
  * The first colon is what matters, not any colon — whatever follows it is never split
- * again, so `json:{"a":"x,y:z"}` is safe, and a value like a detokenised JWT packed with
- * its own colons/commas is also safe: the text before the *first* colon won't be a
+ * again, so `json:{"a":"x,y:z"}` is safe: the text before the *first* colon won't be a
  * recognised verb list, so the whole thing falls through to "literal, unstructured"
  * automatically, with no special-casing needed.
- *
- * Detokenisation always happens before anything else is done with a piece of text, so a
- * token can appear anywhere a value expression accepts text: `[[setting|...]]` works as a
- * literal inline value, as the argument to a cast (`number:[[setting|retryCount]]`), or as
- * a file path (`file:tokens/[[setting|accountId]].json`). For `file:`, this happens
- * *twice* — once on the path (before it's ever resolved/loaded), and again on the loaded
- * file's contents (before any cast is applied to them) — since the path and the content are
- * two different pieces of text, each needing its own tokens resolved at the point each is
- * actually used.
  *
  * @param expression - The raw text to parse.
  * @param options - Optional settings:
@@ -72,6 +62,18 @@ export function isCastVerb(verb: string): verb is CastVerb {
  *     `JSON.stringify`-ed again before going anywhere (e.g. a request body, a header map)
  *     has nothing to lose from passing `true`; a caller that treats the parsed value's
  *     *shape* as evidence the original text really was strict JSON should leave it `false`.
+ *   - `allowCastVerbs` — when `false`, `number`/`boolean`/`json` are not recognised as
+ *     verbs at all, only `file` is — so e.g. `json:hello` is no longer intercepted as a cast
+ *     attempt; it's just the literal text `json:hello`. Defaults to `true`. For a caller
+ *     whose destination can only ever be text anyway (a header value, a query-string
+ *     parameter) — where every cast verb either buys nothing (`number:42` and plain `42`
+ *     produce identical wire text) or actively restricts what's expressible (`json:` can
+ *     resolve to a shape, like a plain object, with no valid wire representation at all) —
+ *     disabling cast verbs removes a footgun with no corresponding capability loss: a value
+ *     that happens to start with a recognised verb's name is no longer misread as a cast
+ *     attempt instead of being sent as the literal text it was meant to be. `file:` stays
+ *     available regardless, since sourcing text from a file is an independent capability
+ *     with nothing to do with casting to a type.
  * @returns The resolved value: a `string`, `number`, `boolean`, or (via `json:`) any
  *   JSON-compatible shape, including an object or array. A caller with narrower
  *   requirements (e.g. a header value, which can never be an object) must validate the
@@ -90,40 +92,33 @@ export function isCastVerb(verb: string): verb is CastVerb {
  * await ValueExpression.parse('json:{a:1}', { useJson5: true }); // => { a: 1 }  (JSON5 — unquoted key)
  * await ValueExpression.parse('file:token.txt');            // => <file contents, trimmed, as a string>
  * await ValueExpression.parse('file,boolean:flag.txt');     // => true/false, cast from file contents
+ * await ValueExpression.parse('json:hello', { allowCastVerbs: false }); // => 'json:hello'  (cast verbs off — literal text, not a cast attempt)
+ * await ValueExpression.parse('file:token.txt', { allowCastVerbs: false }); // => <file contents, trimmed, as a string>  ('file:' still works)
  */
 export class ValueExpression {
-  static async parse(expression: string, options?: { useJson5?: boolean }): Promise<unknown> {
+  static async parse(expression: string, options?: { useJson5?: boolean; allowCastVerbs?: boolean }): Promise<unknown> {
 
     ////////////////////////////////////////////////////
     //
     // Resolves a value-expression string end to end: work out which verbs (if any) the
-    // expression uses, detokenise the remaining argument text, load it from a file if the
-    // 'file' source verb was given (detokenising the loaded content too, as a second,
-    // separate pass), then apply whichever cast verb (if any) was given to the resulting
-    // raw text.
+    // expression uses, load it from a file if the 'file' source verb was given, then apply
+    // whichever cast verb (if any) was given to the resulting raw text.
 
     // expression must actually be a string — fail fast and clearly if not.
     Utils.assertType(expression, "string", "ValueExpression.parse", "expression");
 
     // Work out the source verb / cast verb / remaining argument text from the expression.
-    const { sourceVerb, castVerb, argument } = ValueExpression.splitVerbs(expression);
-
-    // The argument text itself may contain tokens (e.g. a literal value, or a file path) —
-    // resolve those now, before anything else is done with it.
-    const detokenisedArgument = await Detokeniser.doAsync(argument);
+    const { sourceVerb, castVerb, argument } = ValueExpression.splitVerbs(expression, options?.allowCastVerbs ?? true);
 
     let rawText: string;
     if (sourceVerb === SOURCE_VERB) {
-      // 'file' source verb given — resolve the detokenised argument as a path (relative to
-      // the configured test-data root), load that file's contents, trim surrounding
-      // whitespace, then detokenise the loaded content too — the path and the content are
-      // two different pieces of text, each needing its own tokens resolved separately.
-      const resolvedPath = Utils.resolveTestDataPath(detokenisedArgument);
-      const loadedContent = Utils.getFileContents(resolvedPath).trim();
-      rawText = await Detokeniser.doAsync(loadedContent);
+      // 'file' source verb given — resolve the argument as a path (relative to the
+      // configured test-data root), load that file's contents, trim surrounding whitespace.
+      const resolvedPath = Utils.resolveTestDataPath(argument);
+      rawText = Utils.getFileContents(resolvedPath).trim();
     } else {
-      // No source verb given — the detokenised argument text itself IS the raw text, as-is.
-      rawText = detokenisedArgument;
+      // No source verb given — the argument text itself IS the raw text, as-is.
+      rawText = argument;
     }
 
     // Apply whichever cast verb (if any) was given to the resolved raw text, and return
@@ -134,88 +129,93 @@ export class ValueExpression {
   /**
    * Splits `expression` into its (optional) source/cast verbs and the remaining argument,
    * on the *first* colon only. If there's no colon, or the text before it isn't entirely
-   * recognised verbs (comma-separated, each exactly `file`/`number`/`boolean`/`json`), the
-   * whole original `expression` is treated as the argument, with no verbs at all — the
-   * literal, unstructured case.
+   * recognised verbs (comma-separated, each exactly `file`/`number`/`boolean`/`json`, or
+   * just `file` when `allowCastVerbs` is `false`), the whole original `expression` is
+   * treated as the argument, with no verbs at all — the literal, unstructured case.
    */
-  private static splitVerbs(expression: string): { sourceVerb?: string; castVerb?: CastVerb; argument: string } {
+  private static splitVerbs(expression: string, allowCastVerbs: boolean): { sourceVerb?: string; castVerb?: CastVerb; argument: string } {
 
     ////////////////////////////////////////////////////
     //
-    // Identify if passed in string has valid verbs preceding the first colon.  If string has no colon, or
-    // text before the first colon contains and comma delimited text the whole string passed in is passed back
-    // as the argument, with sourceVerb and castVerb returned as undefined.
+    // Identify whether the passed-in string has valid verbs preceding the first colon. If the
+    // string has no colon, or the text before the first colon isn't entirely a comma-delimited
+    // list of recognised verbs, the whole string passed in is handed straight back as the
+    // argument, with sourceVerb and castVerb both left undefined.
 
-
-    // Find first colon in string passed in
+    // Find the first colon in the string passed in.
     const firstColon = expression.indexOf(":");
-    // string has no colons return the whole string as 'argument' (leaving sourceVerb and castVerb undefined)
+    // No colon at all — return the whole string as 'argument' (leaving sourceVerb and castVerb undefined).
     if (firstColon === -1) {
       return { argument: expression };
     }
-    // Check to ensure all texts preceding first colon and split by comma are valid 'verbs'. Checks
-    // using ALL_VERBS set.  If no text preceding the first colon or any comma delimited texts not in ALL_VERBS
-    // return the whole string as 'argument' (leaving sourceVerb and castVerb undefined).  If we do have
-    // a valid list, pass it on for processing in candidateVerbs.
+    // Check that every comma-delimited piece of text preceding the first colon is a recognised
+    // verb — present in ALL_VERBS normally, or in just {file} when allowCastVerbs is false, so
+    // a cast verb's name (e.g. 'json') isn't recognised as a verb at all in that mode. If
+    // there's no text before the colon at all, or any one of the comma-delimited pieces isn't
+    // recognised, this isn't a verb list — return the whole string as 'argument' (leaving
+    // sourceVerb and castVerb undefined). Otherwise, candidateVerbs holds the confirmed,
+    // recognised verb list for the loop below to classify.
+    const recognisedVerbs = allowCastVerbs ? ALL_VERBS : new Set([SOURCE_VERB]);
     const candidateVerbsText = expression.slice(0, firstColon);
     const candidateVerbs = candidateVerbsText.split(",").map((verb) => verb.trim());
-    const allRecognised = candidateVerbsText.length > 0 && candidateVerbs.every((verb) => ALL_VERBS.has(verb));
+    const allRecognised = candidateVerbsText.length > 0 && candidateVerbs.every((verb) => recognisedVerbs.has(verb));
     if (!allRecognised) {
       return { argument: expression };
     }
 
-    // Expression string passed in has valid texts (exist in ALL_VERBS set) preceeding the first colon.  Using list
-    // of strings (candidateVerbs) preceding the first colon check file source exists zero or one times and only as the
-    // first (sourceVerb) verb.  Return value populates;
-    //   - sourceVerb with 'file' if expression has a comma delimited list before the first colon and the first item is
-    //     'file'. 
-    //   - castVerb is undefined, or a string if expression has a comma delimited list before the first colon and the
-    //     list has two values (and the first is 'file') or a single value that is not 'file'.
+    // The text preceding the first colon is confirmed to be entirely recognised verbs. Walk
+    // candidateVerbs and classify each one as the source verb ('file') or a cast verb
+    // ('number'/'boolean'/'json'), populating:
+    //   - sourceVerb: 'file', if 'file' appears anywhere in the list (always valid at most once).
+    //   - castVerb: whichever cast verb appears in the list (also valid at most once) — or
+    //     undefined if the list contained only 'file' and nothing else.
     let sourceVerb: string | undefined;
     let castVerb: CastVerb | undefined;
-    // Loop through all comma demimited texts, preceding express string first colon.
+    // Loop through every comma-delimited verb found before the expression's first colon.
     for (const verb of candidateVerbs) {
-      // Check if current text is SOURCE_VERB (file')
+      // This item is the source verb ('file').
       if (verb === SOURCE_VERB) {
-        // Current item's text is 'file' (SOURCE_VERB), so check sourceVerb hasn't already been defined (ie. 'file,file:....').
+        // 'file' already seen earlier in this same list (e.g. 'file,file:...') — reject it: only
+        // one source verb is allowed.
         if (!Utils.isUndefined(sourceVerb)) {
-          // sourceText already defined so error and abort.
           Log.logErrorAndThrow(`ValueExpression.parse: [${expression}] repeats the '${SOURCE_VERB}' verb — only one source verb is allowed`);
         }
-        // sourceVerb not already set so set to current item's text ('file')
+        // First time seeing 'file' in this list — record it.
         sourceVerb = verb;
       } else {
-        // Current items text is NOT 'file'.  So check if it is a cast verb (ie Exists in CAST_VERB set).
+        // This item isn't 'file', so (since it already passed the ALL_VERBS check above) it must
+        // be one of the cast verbs. isCastVerb is a real runtime check, not just a type
+        // assertion — see its own doc comment for why that matters.
         if (!isCastVerb(verb)) {
-          // Current item text does NOT exist in CAST_VERB set so error and abort.
           Log.logErrorAndThrow(`ValueExpression.parse: [${expression}] — [${verb}] is not a recognised cast verb (expected one of: ${CAST_VERBS.join(", ")}).`);
         }
-        // Current item's text is an item in CAST_VERB set, so check castVerb hasn't already been defined (ie. 'boolean,number:....').
+        // A cast verb already seen earlier in this same list (e.g. 'boolean,number:...') —
+        // reject it: only one cast verb is allowed.
         if (!Utils.isUndefined(castVerb)) {
           Log.logErrorAndThrow(`ValueExpression.parse: [${expression}] combines conflicting cast verbs ['${castVerb}', '${verb}'] — only one cast verb is allowed`);
         }
-        //castVerb not already set so set to current item's text
+        // First cast verb seen in this list — record it.
         castVerb = verb;
       }
     }
 
-    // sourceVerb is undefined unless expression has a comma delimited list before the first colon and the first or only item
-    //   is the text 'file', in which case it is the text string 'file'.
-    // castVerb is undefined unless expression has a comma delimited list before the first colon, with number of items
-    //   1 (NOT the text 'file', but exists in SO) or 2 (and first 
+    // sourceVerb is 'file' if the verb list contained 'file' (in either position: alone, or
+    // paired with a cast verb), otherwise undefined.
+    // castVerb is whichever cast verb the verb list contained (alone, or paired with 'file'),
+    // otherwise undefined. argument is always everything after that first colon, unchanged.
     return { sourceVerb, castVerb, argument: expression.slice(firstColon + 1) };
   }
 
-  /** Applies the resolved cast verb (if any) to the already-source-resolved, already-detokenised raw text. */
+  /** Applies the resolved cast verb (if any) to the already-source-resolved raw text. */
   private static applyCast(originalExpression: string, rawText: string, castVerb: CastVerb | undefined, useJson5: boolean): unknown {
 
     ////////////////////////////////////////////////////
     //
     // Applies whichever cast verb (if any) was resolved by splitVerbs to the already
-    // source-resolved, already-detokenised raw text, and returns the cast value. No cast
-    // verb at all just returns the raw text unchanged, as a plain string — every other
-    // branch either returns a successfully-cast value or throws a clear error, never both
-    // "sort of worked" and silent.
+    // source-resolved raw text, and returns the cast value. No cast verb at all just
+    // returns the raw text unchanged, as a plain string — every other branch either
+    // returns a successfully-cast value or throws a clear error, never both "sort of
+    // worked" and silent.
 
     switch (castVerb) {
       // No cast verb given — return the raw text unchanged, as a plain string.

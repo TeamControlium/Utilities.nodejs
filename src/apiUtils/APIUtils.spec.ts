@@ -982,12 +982,10 @@ describe("APIUtils.resolveBinaryFileRequestBody", () => {
     expect(result.body.length).toBe(4);
   });
 
-  it("resolves a token in the filename itself before resolving the path", async () => {
+  it("passes the filename through verbatim — no token resolution", async () => {
     vi.spyOn(Utils, "getFileContentsBuffer").mockReturnValue(Buffer.from("x"));
-    await APIUtils.resolveBinaryFileRequestBody(
-      '[[setting|processEnvName: "API_UTILS_SPEC_DEFINITELY_NOT_SET_XYZ", defaultValue: "resolved-name.bin"]]'
-    );
-    expect(Utils.resolveTestDataPath).toHaveBeenCalledWith("resolved-name.bin");
+    await APIUtils.resolveBinaryFileRequestBody("[[setting|processEnvName: \"X\"]]");
+    expect(Utils.resolveTestDataPath).toHaveBeenCalledWith("[[setting|processEnvName: \"X\"]]");
   });
 });
 

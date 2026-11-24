@@ -1,137 +1,87 @@
-import { addDays, addHours, addMinutes, addMonths, addYears, format } from "date-fns";
-import { formatInTimeZone, getTimezoneOffset } from "date-fns-tz";
-
-import { JsonUtils, Log, LogLevels, StringUtils, Utils } from "../index.js";
-
-// ─── MockUtils stub ───────────────────────────────────────────────────────────
-// TODO: Replace with real import when MockUtils is brought into the package
-const MockUtils = {
-  interceptedRequests: undefined as object[] | undefined,
-};
-
-
-interface RunningString {
-  currentToken: InnermostToken;
-  outputString: string;
-}
-interface DoTokenReturn {
-  processedToken?: string;
-}
-interface DoTokenPreambleReturn {
-  offsetAndFormat: string[];
-  verb: string;
-  params: string | undefined;
-  errParseDateOffset: string;
-  errInvalidEpoch: string;
-  errRandomParams: string;
-  errFollowingDayParams: string;
-  errInvalidDateVerb: string;
-  // Raw IANA zone name (e.g. "Europe/London"), if the date token's optional 3rd part supplied
-  // one — undefined means "format in local time", same as omitting it entirely.
-  ianaZone: string | undefined;
-}
+import { Log, LogLevels, StringUtils, Utils } from "../index.js";
+import { builtinDate, builtinDiff, builtinTimezone } from "./dateBuiltins.js";
+import { builtinBase64, builtinJWT } from "./encodingBuiltins.js";
+import { builtinMockRequests } from "./mockingBuiltins.js";
+import { builtinRandom } from "./randomBuiltins.js";
+import { builtinSetting } from "./systemBuiltins.js";
 
 /**
- * Processes strings containing tokens in the format `[[tokenType|expression|format]]`, replacing each
- * token with its resolved value. Tokens can be nested — the innermost is always resolved first.
+ * Thrown by {@link Detokeniser.doToken} specifically when nothing — no registered callback,
+ * no built-in — claims the matched verb at all. A dedicated type, not a plain `Error`, so
+ * {@link Detokeniser.resolveTokens} can tell this one case apart from every other way
+ * resolving a token can fail (a callback/built-in that *did* recognise the verb, then
+ * rejected its arguments) without string-matching an error message — brittle, and the kind of
+ * thing a future wording change would silently break.
+ *
+ * Why this distinction matters: an unrecognised verb is the exact, unavoidable symptom of two
+ * completely different situations that look identical from here — a genuinely malformed `[[`/
+ * `]]` pair that was never a token at all (most realistically incidental, unrelated `[[`/`]]`
+ * adjacency in surrounding literal data, e.g. a JSON nested array like `[[1,2],[3,4]]`), or a
+ * test author's genuine typo in a real verb name (`[[radnom|digits|4]]`). `resolveTokens`
+ * resolves that ambiguity in favour of the former — treating the whole matched span as literal,
+ * unresolved text rather than throwing — a deliberate trade, not a default: it accepts that a
+ * genuine verb-name typo now fails silently (the literal, unresolved token text flows straight
+ * through, with only a `Warning`-level log to notice it by) in exchange for literal `[[`/`]]`
+ * adjacency anywhere in untouched, unrelated data no longer breaking detokenisation outright.
+ * See `utils/docs/design/detokeniser-structural-parsing-redesign.md`'s "third gap" section for
+ * the full reasoning and the alternatives considered.
+ */
+class UnsupportedTokenError extends Error {}
+
+/**
+ * Max length {@link Detokeniser.doAsync}'s own top-level `TestDebug` logging truncates the raw
+ * string to, via {@link StringUtils.truncateIfNeeded}, for the single-line "no tokens found"
+ * case — short, since nothing was actually resolved, there's nothing further worth showing.
+ */
+const LOG_NO_TOKEN_TRUNCATE_LENGTH = 48;
+
+/**
+ * Max length {@link Detokeniser.doToken}'s own per-token `TestDebug` logging truncates the raw
+ * token text and its resolved value to, independently, via {@link StringUtils.truncateIfNeeded}
+ * — one line per token actually resolved, e.g. `Processed [[[jwt;...]]] to [eyJ...]`, so a
+ * multi-token string gets one clearly-paired line per token rather than one undifferentiated
+ * before/after dump of the whole string.
+ */
+const LOG_TOKEN_TRUNCATE_LENGTH = 64;
+
+/**
+ * Processes strings containing tokens in the format `[[verb|arg|arg]]`, replacing each token
+ * with its resolved value. Tokens can be nested — the innermost is always resolved first.
+ *
+ * This file is the resolution *engine* only: token-boundary scanning, escaping, the
+ * innermost-first resolve loop, and the verb/qualifier/args dispatch mechanism. The built-in
+ * verbs themselves (`random`/`date`/`timezone`/`diff`/`setting`/`base64`/`jwt`/
+ * `mockintercepts`) live in sibling files, grouped by what they do — `randomBuiltins.ts`,
+ * `dateBuiltins.ts`, `systemBuiltins.ts`, `encodingBuiltins.ts`, `mockingBuiltins.ts` — see
+ * each one's own doc comment for the verbs it implements and their syntax.
  *
  * ## Token syntax
  * ```
- * [[tokenType|expression|format]]
+ * [[verb|arg|arg]]
+ * [[verb(qualifier)|arg|arg]]
  * ```
- * - **tokenType** — identifies the built-in handler or is matched against registered callbacks
- * - **expression** — what to compute (type-specific)
- * - **format** — how to format the result (type-specific, often optional)
+ * - **verb** — identifies which registered handler resolves this token (see "Dispatch" below)
+ * - **qualifier** — optional, parenthesised text immediately after the verb, with no delimiter
+ *   before it (e.g. `date(nsw)`). Not interpreted by the engine at all — it's handed to
+ *   whichever handler matches `verb`, for that handler to interpret however it likes (e.g. a
+ *   business-day-aware `date` callback might use a qualifier to select a public-holiday
+ *   calendar). None of the built-in verbs use one today.
+ * - **arg** — handler-specific, `|`-delimited (each built-in's own file documents its shape)
  *
- * ---
- * ## Built-in token types
+ * ### Qualifier parsing
+ * A qualifier is only recognised if `(` immediately follows the verb name, with nothing in
+ * between. Its content is everything up to the first *unescaped* `)` — not nesting-aware,
+ * the same rule several built-ins already use for their own paren-delimited arguments (e.g.
+ * `random|from(...)`): an inner `(` is just a literal character with no special meaning, only
+ * the first unescaped `)` ends it. A literal `)` inside a qualifier needs the escape char
+ * (`/)`), same as everywhere else in this grammar. An unterminated `(` (no closing `)` found
+ * before the end of the token) throws a clear error rather than guessing what was meant.
  *
- * ### `random` — random data
- * | Expression | Format | Example | Sample output |
- * |---|---|---|---|
- * | `digits` | count | `[[random\|digits\|6]]` | `482910` |
- * | `letters` | count | `[[random\|letters\|4]]` | `xKpQ` |
- * | `lowercaseletters` | count | `[[random\|lowercaseletters\|4]]` | `xkpq` |
- * | `uppercaseletters` | count | `[[random\|uppercaseletters\|4]]` | `XKPQ` |
- * | `alphanumerics` | count | `[[random\|alphanumerics\|8]]` | `a3Kx92Zp` |
- * | `from(<chars>)` | count | `[[random\|from(aeiou)\|3]]` | `ioa` |
- * | `float(min,max)` | decimal places | `[[random\|float(1.5,3.7)\|2]]` | `2.83` |
- * | `date(fromEpoch,toEpoch)` | date format | `[[random\|date(0,1700000000000)\|yyyy-MM-dd]]` | `1994-07-12` |
- *
- * ### `date` — date and time
- * Format is a [date-fns format string](https://date-fns.org/docs/format), or the special values
- * `epoch` (milliseconds since 1970-01-01) or `second-epoch`.
- *
- * | Expression | Example | Sample output |
- * |---|---|---|
- * | `today` / `now` | `[[date\|today\|dd-MM-yyyy]]` | `01-04-2026` |
- * | `yesterday` | `[[date\|yesterday\|dd-MM-yyyy]]` | `31-03-2026` |
- * | `tomorrow` | `[[date\|tomorrow\|dd-MM-yyyy]]` | `02-04-2026` |
- * | `addYears(n)` | `[[date\|addYears(-1)\|yyyy]]` | `2025` |
- * | `addMonths(n)` | `[[date\|addMonths(3)\|MMM yyyy]]` | `Jul 2026` |
- * | `addDays(n)` | `[[date\|addDays(5)\|dd-MM-yyyy]]` | `06-04-2026` |
- * | `addHours(n)` | `[[date\|addHours(2)\|HH:mm]]` | `14:30` |
- * | `addMinutes(n)` | `[[date\|addMinutes(30)\|HH:mm]]` | `13:00` |
- * | `random(fromEpoch,toEpoch)` | date format | `[[date\|random(0,1700000000000)\|yyyy-MM-dd]]` | random date |
- * | `followingDay(epoch,dayName)` | date format | `[[date\|followingDay(1711929600000,wednesday)\|dd-MM-yyyy]]` | next Wednesday |
- * | `yyyy-MM-dd` _(fixed date)_ | date format | `[[date\|2026-06-15\|EEEE]]` | `Monday` |
- *
- * An optional 3rd part gives a raw IANA zone name to format in, instead of local time — see
- * `timezone` below for where that string typically comes from:
  * ```
- * [[date|today|HH:mm|Europe/London]]              ← formatted in London time
- * [[date|addDays(1)|dd-MM-yyyy|Asia/Tokyo]]
- * ```
- *
- * Business-day-aware date math (skipping weekends/public holidays) and place-name-to-zone
- * lookups are deliberately **not** built in — they need an external data source (a holiday
- * calendar, a geocoding service) this package has no business bundling. Register a callback
- * via {@link Detokeniser.addCallback} for either, from a framework plugin or test suite.
- *
- * ### `timezone` — validate an IANA zone name
- * Validates its argument against the runtime's own IANA timezone database (`Intl.supportedValuesOf`)
- * and returns it unchanged if valid, or throws a clear error if not. Exists so a zone name can be
- * nested inside `date`/`diff` with the same validation either way gets, whether typed directly or
- * produced by some other token.
- * ```
- * [[timezone|Europe/London]]   →  Europe/London
- * [[timezone|Nowhere/Fake]]    →  throws: not a recognised IANA timezone name
- * ```
- *
- * ### `diff` — hours between two IANA zones
- * Signed difference, in hours, between two zones' current UTC offset (`zoneA` minus `zoneB`),
- * as a plain decimal number string — e.g. `"5"`, `"-5.5"`, `"5.75"` (Nepal-style quarter-hour
- * zones). "UTC" is itself a valid zone, so this also covers a single zone's offset from UTC.
- * ```
- * [[diff|Europe/London|Africa/Lusaka]]   →  e.g. "-2" (seasonal — Europe/London observes DST)
- * [[diff|Asia/Kathmandu|UTC]]            →  e.g. "5.75"
- * ```
- *
- * ### `setting` — retrieve a configured value
- * Parameters are given as JSON key/value pairs after the delimiter. Resolution order:
- * process env → npm config → context parameters → default value.
- * ```
- * [[setting|processEnvName: "MY_VAR"]]
- * [[setting|processEnvName: "MY_VAR", defaultValue: "fallback"]]
- * [[setting|npmPackageConfigName: "myconfig"]]
- * [[setting|profileParameterName: "myParam", defaultValue: "none"]]
- * ```
- *
- * ### `base64` — encode or decode
- * ```
- * [[base64|encode|Hello World]]        →  SGVsbG8gV29ybGQ=
- * [[base64|decode|SGVsbG8gV29ybGQ=]]   →  Hello World
- * ```
- *
- * ### `jwt` — generate a signed JWT
- * ```
- * [[jwt|{"sub":"1234","name":"Test"}|MySecret]]
- * [[jwt|{"sub":"1234"}|MySecret|{"algorithm":"HS256"}]]
- * ```
- *
- * ### `mockintercepts` — harvest a value from intercepted mock requests
- * ```
- * [[mockintercepts|$.requests[0].body.userId]]
+ * date(nsw)|addWorkingDays(7)|dd/MM/yyyy   → verb "date", qualifier "nsw"
+ * someverb(ddd(sd)|arg1|arg2               → verb "someverb", qualifier "ddd(sd" (first
+ *                                             unescaped ")" ends it — the earlier "(" is just
+ *                                             literal qualifier text, not nesting)
  * ```
  *
  * ---
@@ -143,14 +93,12 @@ interface DoTokenPreambleReturn {
  *
  * // Hours between Lusaka and London, right now
  * await Detokeniser.doAsync('[[diff|[[timezone|Africa/Lusaka]]|[[timezone|Europe/London]]]]');
- *
- * // "Now", formatted in Tokyo time
- * await Detokeniser.doAsync('[[date|today|yyyy-MM-dd HH:mm|[[timezone|Asia/Tokyo]]]]');
  * ```
  *
  * ---
  * ## Escaping
- * The escape character is `/` (configurable via `EscapeChar`). Escaping only has any effect
+ * The escape character is `/`, fixed — `EscapeChar` is a private implementation detail, not
+ * a public setting. Escaping only has any effect
  * immediately before a token boundary sequence (`[[` or `]]`) — a run of escape chars
  * anywhere else in the string (e.g. the `//` in `https://example.com`) is left completely
  * untouched, not collapsed. This is deliberate: an escape character's only job is resolving
@@ -165,8 +113,6 @@ interface DoTokenPreambleReturn {
  * | `/]]` | `]]` | Literal `]]` — not treated as token end |
  * | `//[[` | `/[[` | Escaped escape char, followed by a real token start |
  * | `https://example.com` | `https://example.com` | `//` here is nowhere near `[[`/`]]` — left alone, not collapsed |
- * | `[[random\|from(xyz/[[)\|3]]` | 3 chars from `xyz[[` | `/[[` inside `from()` = `/[` (→`[`) + `[` = two `[` (higher weight) |
- * | `[[random\|from(abc/))\|2]]` | 2 chars from `abc)` | `/)` inside `from()` = literal `)` |
  *
  * De-escaping normally happens automatically at the end of {@link Detokeniser.doAsync} — pass
  * `{ deEscape: false }` ({@link Detokeniser.DoOptions.deEscape}) to defer it, when this call's
@@ -174,15 +120,23 @@ interface DoTokenPreambleReturn {
  * later, final pass.
  *
  * ---
- * ## Extending with callbacks
- * Custom token types are registered via {@link Detokeniser.addCallback}. Both sync and async handlers
- * share the same registration method and callback list. Callbacks are tried in registration order;
- * return `undefined` to pass to the next callback. If all callbacks return `undefined` and no built-in
- * handler matched, an error is thrown.
+ * ## Dispatch — built-ins are callbacks too
+ * Every built-in verb is registered into {@link Detokeniser._builtinCallbacks} the same shape
+ * {@link Detokeniser.addCallback} registers a custom one into — a built-in isn't a privileged
+ * special case, it's just always present. Resolving a token tries, in order:
+ * 1. Every callback registered for that verb via {@link Detokeniser.addCallback}, most
+ *    recently registered first — so a callback can deliberately override an earlier one, or
+ *    override a built-in of the same verb name.
+ * 2. The built-in registered for that verb, if any.
  *
- * {@link Detokeniser.doAsync} is the only entry point — it always awaits every callback, sync or
- * async, so there's no separate sync method whose caller would need to know in advance whether
- * every token a test might pass in resolves synchronously or not.
+ * A callback declines by returning `undefined`, passing to the next one tried. If nothing
+ * claims the verb at all, {@link Detokeniser.resolveTokens} treats the whole matched `[[...]]`
+ * span as literal, unresolved text (logged at `Warning`) rather than throwing — see
+ * {@link UnsupportedTokenError}'s own doc comment for why.
+ *
+ * {@link Detokeniser.doAsync} is the only entry point — it always awaits every callback, sync
+ * or async, so there's no separate sync method whose caller would need to know in advance
+ * whether every token a test might pass in resolves synchronously or not.
  *
  * @see {@link Detokeniser.addCallback}
  * @see {@link Detokeniser.doAsync}
@@ -191,9 +145,51 @@ export class Detokeniser {
   private static readonly _endTokenChar = "]]";
   private static readonly _startTokenChar = "[[";
   private static EscapeChar = "/";
-  private static readonly _delimiter = "|";
+  private static _delimiter = "|";
 
-  private static _callbacks: Array<Detokeniser.Callback> | undefined = undefined;
+  /**
+   * The only characters a caller may set {@link Detokeniser.delimiter} to. Deliberately an
+   * allow-list, not a deny-list of "known bad" characters: several structurally-significant
+   * characters are already baked into the grammar in ways that are easy to forget all of —
+   * `[`/`]` (token boundaries), `(`/`)` (the qualifier syntax, and several built-ins' own
+   * sub-grammar — `date`'s `addDays(n)`, `random`'s `from(...)`/`float(min,max)`), `/` (the
+   * escape char), `,` (several built-ins' own sub-argument separator — `random|float(min,max)`,
+   * `date|random(fromEpoch,toEpoch)`, `date|followingDay(epoch,dayName)`), and `'`/`"` (the
+   * quoting convention `jwt`/`base64`/`diff` already rely on to protect a literal delimiter
+   * character inside a value). A deny-list would mean every future built-in's own syntax is a
+   * fresh, undocumented way to silently re-break the delimiter feature; an allow-list keeps it
+   * safe by construction regardless of what any future verb introduces.
+   *
+   * Narrowed further than just "whatever's left", to non-alphanumeric punctuation only — a
+   * letter/digit delimiter doesn't break the grammar, but reopens the same class of problem
+   * from the opposite direction: a character that routinely shows up as *data* inside a
+   * resolved value (e.g. almost any letter or digit appears somewhere in typical base64
+   * output) is a live footgun even with escaping available, since nobody escapes content they
+   * don't know is there. A space is deliberately included — unusual, but a caller's own choice
+   * to make, and it doesn't collide with anything.
+   */
+  private static readonly _allowedDelimiters = new Set([" ", "|", ";", ":", "~", "^", "!", "?", "&"]);
+
+  // User-registered callbacks, keyed by verb (lowercased/trimmed). Lazily created on first
+  // addCallback call — most consumers never register one at all, so this stays undefined
+  // (not an empty Map) until needed. Cleared by resetCallbacks()/reset() — test/suite state,
+  // not framework capability, per the "100% clean start every test" guarantee those two
+  // methods exist to provide.
+  private static _userCallbacks: Map<string, Array<Detokeniser.Callback>> | undefined = undefined;
+
+  // Built-in verb handlers, keyed by verb. Framework capability, not test state — untouched
+  // by reset()/resetCallbacks(). Tried by doToken only after every _userCallbacks entry
+  // registered for that same verb has had a turn.
+  private static readonly _builtinCallbacks: Map<string, Detokeniser.Callback> = new Map<string, Detokeniser.Callback>([
+    ["random", builtinRandom],
+    ["date", builtinDate],
+    ["timezone", builtinTimezone],
+    ["diff", builtinDiff],
+    ["setting", builtinSetting],
+    ["base64", builtinBase64],
+    ["jwt", builtinJWT],
+    ["mockintercepts", builtinMockRequests],
+  ]);
 
   /**
    * Master on/off switch for token processing. When `false`, {@link Detokeniser.doAsync}
@@ -217,10 +213,52 @@ export class Detokeniser {
   public static enabled = true;
 
   /**
+   * The character that separates a verb (and optional qualifier) from its arguments, and
+   * separates one argument from the next — e.g. the `|`s in `[[random|digits|6]]`. A getter/
+   * setter pair, not a plain field like {@link Detokeniser.enabled}: unlike a boolean, a bad
+   * value here (multi-character, or one of the handful of characters already structurally
+   * significant elsewhere in the grammar) can't just be tolerated — it needs rejecting
+   * immediately, at the point it's set, not discovered later as a confusing parse failure deep
+   * inside some unrelated token.
+   *
+   * Still plain-assignable, exactly like `enabled` — `Detokeniser.delimiter = ';'` — a caller
+   * never needs to call a separate method; the validation is just transparent to that syntax.
+   *
+   * Restricted to a fixed allow-list ({@link Detokeniser._allowedDelimiters} — see its own doc
+   * comment for the full reasoning): `|` (the default), space, `;`, `:`, `~`, `^`, `!`, `?`,
+   * `&`. Every character outside that list either already means something else in this
+   * grammar (`[`/`]`/`(`/`)`/`/`/`,`/`'`/`"`) or is a letter/digit that would routinely collide
+   * with ordinary resolved-value content (e.g. base64 output).
+   *
+   * @throws {Error} If set to anything other than a single character from the allow-list.
+   * @default "|"
+   * @see {@link Detokeniser.reset} — restores this to `"|"`, among other defaults.
+   * @example
+   * Detokeniser.delimiter = ';'; // e.g. in a Cucumber Before hook, to avoid a DataTable's own
+   *                               // use of '|' as a column separator colliding with a token's
+   * Detokeniser.delimiter = '('; // throws — '(' is already the qualifier/sub-grammar character
+   */
+  public static get delimiter(): string {
+    return this._delimiter;
+  }
+
+  public static set delimiter(value: string) {
+    Utils.assertType(value, "string", "Detokeniser.delimiter", "value");
+    if (!this._allowedDelimiters.has(value)) {
+      throw new Error(
+        `Detokeniser.delimiter: [${Utils.describeValue(value)}] is not an allowed delimiter character — must be exactly one of: ` +
+        [...this._allowedDelimiters].map((char) => (char === " " ? "<space>" : char)).join(", ")
+      );
+    }
+    this._delimiter = value;
+  }
+
+  /**
    * Resets the Detokeniser to factory defaults:
    * - {@link Detokeniser.enabled} restored to `true`
+   * - {@link Detokeniser.delimiter} restored to `"|"`
    * - Escape char restored to `/`
-   * - All registered sync and async callbacks cleared
+   * - All user-registered callbacks cleared
    *
    * Call this in test teardown to guarantee a clean state between scenarios.
    * @example
@@ -228,66 +266,70 @@ export class Detokeniser {
    */
   public static reset() {
     this.enabled = true;
+    this.delimiter = "|";
     this.EscapeChar = "/";
-    this._callbacks = undefined;
+    this._userCallbacks = undefined;
   }
 
   /**
-   * Registers a custom token handler. Both sync and async handlers are registered via this method
-   * and share the same callback list.
+   * Registers a custom handler for `verb`. Both sync and async handlers are registered via
+   * this method and share the same per-verb callback list.
    *
-   * Callbacks are tried in registration order. The first to return a non-`undefined` value wins.
-   * Return `undefined` to pass to the next callback. If all callbacks return `undefined` and no
-   * built-in handler matched, an error is thrown.
+   * Handlers registered for the same verb are tried in **reverse** registration order
+   * (most-recently-registered first) — so the latest one wins among several, and any of them
+   * can override a built-in of the same verb name (built-ins are only tried after every
+   * registered callback for that verb has declined). Return `undefined` to pass to the next
+   * handler; an error is thrown if nothing matches at all.
    *
-   * {@link Detokeniser.doAsync} — the single entry point — always awaits every registered
-   * callback, sync or async, so either kind works without the caller needing to know in
-   * advance which one it registered.
-   *
-   * @param callback - `(token: string) => string | undefined | Promise<string | undefined>`
-   *   - `token` — full token body without `[[` / `]]`, e.g. `"mytype|arg1|arg2"` (delimiter is always `|`)
-   *
-   * @example
-   * // Sync handler for [[env|VAR_NAME]] tokens
-   * Detokeniser.addCallback((token) => {
-   *   const [type, name] = token.split('|');
-   *   if (type !== 'env') return undefined;
-   *   return process.env[name] ?? '';
-   * });
-   * await Detokeniser.doAsync('Path: [[env|HOME]]'); // → 'Path: /home/user'
+   * @param verb - The verb this handler resolves, e.g. `"charcode"` for `[[charcode|...]]`
+   *   tokens. Matched case-insensitively, trimmed.
+   * @param callback - `(context: Detokeniser.CallbackContext) => string | undefined | Promise<string | undefined>`
+   *   — see {@link Detokeniser.CallbackContext} for what's available on `context`
    *
    * @example
-   * // Async handler for [[db|table|column|where]] tokens
-   * Detokeniser.addCallback(async (token) => {
-   *   const [type, table, column, where] = token.split('|');
-   *   if (type !== 'db') return undefined;
-   *   const row = await db.query(`SELECT ${column} FROM ${table} WHERE ${where} LIMIT 1`);
-   *   return String(row[column]);
+   * // Handler for [[charcode|A|hex]] tokens — splits on `delimiter`, not a hardcoded '|', so
+   * // it keeps working if a caller has changed Detokeniser.delimiter.
+   * Detokeniser.addCallback('charcode', ({ args, delimiter }) => {
+   *   const [char, base] = args.split(delimiter);
+   *   const code = char.charCodeAt(0);
+   *   return base === 'hex' ? code.toString(16) : String(code);
    * });
-   * const result = await Detokeniser.doAsync('ID: [[db|users|id|active=1]]');
+   * await Detokeniser.doAsync('[[charcode|A|hex]]'); // → '41'
+   *
+   * @example
+   * // Async handler reading options.contextParameters
+   * Detokeniser.addCallback('fromContext', ({ args, options }) => {
+   *   return String(options.contextParameters?.[args] ?? '');
+   * });
    *
    * @see {@link Detokeniser.resetCallbacks} to remove all registered callbacks
    * @see {@link Detokeniser.doAsync}
    */
-  public static addCallback(callback: Detokeniser.Callback) {
-    // callback must actually be a function — fail fast and clearly if not.
+  public static addCallback(verb: string, callback: Detokeniser.Callback) {
+    Utils.assertType(verb, "string", "Detokeniser.addCallback", "verb");
     Utils.assertType(callback, "function", "Detokeniser.addCallback", "callback");
-    // Lazily create the callback list on first registration — most consumers never register
-    // any callback at all, so this stays undefined (not an empty array) until needed.
-    if (!this._callbacks) {
-      this._callbacks = new Array<Detokeniser.Callback>();
+    const key = verb.toLowerCase().trim();
+    // Lazily create the Map on first registration, and the per-verb array on first
+    // registration for that specific verb.
+    if (!this._userCallbacks) {
+      this._userCallbacks = new Map<string, Array<Detokeniser.Callback>>();
     }
-    // Append — callbacks are tried in registration order, so this list's order is significant.
-    this._callbacks.push(callback);
+    if (!this._userCallbacks.has(key)) {
+      this._userCallbacks.set(key, []);
+    }
+    // Append — tryHandlers below tries this list in REVERSE order, so the most recently
+    // registered callback for this verb is the first one tried.
+    this._userCallbacks.get(key)!.push(callback);
   }
 
   /**
-   * Removes all registered callbacks. Built-in token handlers are unaffected.
+   * Removes all user-registered callbacks. Built-in handlers live in
+   * {@link Detokeniser._builtinCallbacks}, untouched by this method.
    * Use between tests or scenarios to ensure callback isolation.
    * @see {@link Detokeniser.reset} to also restore all defaults
    */
   public static resetCallbacks() {
-    this._callbacks = undefined;
+    this._userCallbacks = undefined;
   }
 
   /**
@@ -310,7 +352,6 @@ export class Detokeniser {
    * @example
    * await Detokeniser.doAsync('Ref-[[random|digits|6]]');                        // → e.g. 'Ref-482910'
    * await Detokeniser.doAsync('Expires [[date|addDays(30)|dd/MM/yyyy]]');        // → e.g. 'Expires 01/05/2026'
-   * await Detokeniser.doAsync('[[random|uppercaseletters|3]]-[[random|digits|4]]'); // → e.g. 'XKP-7391'
    *
    * @example
    * // Nested tokens — innermost resolved first
@@ -326,87 +367,57 @@ export class Detokeniser {
    * // Escaping — produce literal [[ / ]] in output
    * await Detokeniser.doAsync('Press /[[Enter/]] to continue'); // → 'Press [[Enter]] to continue'
    *
-   * @example
-   * // Async callback for database-driven tokens
-   * Detokeniser.addCallback(async (token) => {
-   *   const [type, key] = token.split('|');
-   *   if (type !== 'db') return undefined;
-   *   return await fetchFromDatabase(key);
-   * });
-   * await Detokeniser.doAsync('User: [[db|users.name.first]]');
+   * ## Debug logging
+   * If `tokenisedString` contains `[[` anywhere, each token actually resolved is logged
+   * individually, once, by {@link Detokeniser.doToken} — one `TestDebug` line per token,
+   * pairing its own raw text with its own resolved value (see that method's doc comment),
+   * so a multi-token string gets one clearly-paired line per token rather than one
+   * undifferentiated dump of the whole input and the whole output. Otherwise (no `[[` at all),
+   * this method itself logs a single line: `Processed [<tokenisedString, truncated>], no
+   * tokens found` — logged exactly once per call here in `doAsync` itself, never inside
+   * {@link Detokeniser.resolveTokens} (the actual scan), since that method has no equivalent
+   * notion of "a call" to guard against double-logging — it's a single pass, not recursive.
+   * The `[[`-presence check this relies on is a cheap substring test, not real
+   * parsing — see {@link Detokeniser.doToken}'s own doc comment for the one edge case that
+   * follows from that (an escaped-only or unterminated `[[` logs nothing at all, rather than
+   * "no tokens found" — the presearch says tokens might be present, but none actually resolve).
    */
   public static async doAsync(tokenisedString: string, options: Detokeniser.DoOptions = {}): Promise<string> {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves every token in tokenisedString, innermost-first: locate the leftmost-deepest
-    // token, resolve it via doToken (awaiting it, so a registered callback can itself be
-    // async), splice the resolved text back in, then recurse on the resulting string (which
-    // may expose a new token, or may not) until no tokens remain — then de-escape any escaped
-    // token-boundary sequences in the final result, unless the caller deferred that to a later
-    // pass via options.deEscape. This is the single, sole entry point — see this method's own
-    // doc comment above for why there's deliberately no separate synchronous sibling.
-
     // Master on/off switch — when disabled, return the input completely unchanged.
     if (!this.enabled) return tokenisedString;
 
-    // Caller's own de-escape preference (defaults to true); deEscape (below) separately
-    // tracks whether this call's own while-loop ever actually found/resolved a token.
-    const deEscapeOption = options.deEscape ?? true;
-    let deEscape = true;
+    // A non-string input is never valid — but the [[-presence check just below assumes a
+    // string to call .includes on, so a bad type must be deferred to doResolve's own
+    // Utils.assertType (inside its try/catch) before this method does anything else with it.
+    if (typeof tokenisedString !== "string") {
+      return this.doResolve(tokenisedString, options);
+    }
 
+    // No "[[" anywhere at all — resolveTokens' scan will never find a token to hand to
+    // doToken, so nothing will log anything for this call unless this method does. See this
+    // method's own "Debug logging" doc section above for why this specific check (rather than,
+    // say, comparing the final result to the input) is what decides this.
+    if (!tokenisedString.includes(this._startTokenChar)) {
+      Log.writeLine(LogLevels.FrameworkInformation, `Processed [${StringUtils.truncateIfNeeded(tokenisedString, LOG_NO_TOKEN_TRUNCATE_LENGTH)}], no tokens found`);
+    }
+
+    return this.doResolve(tokenisedString, options);
+  }
+
+  /**
+   * Wraps {@link Detokeniser.resolveTokens} — the actual scan — with type validation, error
+   * context, and the final de-escape pass. Factored out from {@link Detokeniser.doAsync}
+   * purely so that method's own "no tokens found" check fires exactly once per real external
+   * call. Not part of this class's public API.
+   */
+  private static async doResolve(tokenisedString: string, options: Detokeniser.DoOptions = {}): Promise<string> {
     try {
       // tokenisedString must actually be a string — fail fast and clearly if not.
       Utils.assertType(tokenisedString, "string", "Detokeniser.doAsync", "tokenisedString");
-      // Locate the first (innermost, leftmost) token, splitting the string into
-      // preamble / token / postamble around it.
-      const runningString = this.doPreamble(tokenisedString);
-
-      // Loop until last token find found no tokens
-      while (runningString.currentToken.hasToken) {
-        // Process the last found token, prepend it to the text after the last found token then find any token in the resulting string
-        runningString.currentToken = new InnermostToken(
-          (await this.doToken(runningString.currentToken.childToken.substring(this._startTokenChar.length), options)) +
-          runningString.currentToken.postamble,
-          this._startTokenChar,
-          this._endTokenChar,
-          this.EscapeChar
-        );
-        // Diagnostic trace of this iteration's split, for debugging nested-token resolution.
-        const logToken = runningString.currentToken.hasToken ? runningString.currentToken.childToken : '<No Token>';
-        Log.writeLine(
-          LogLevels.TestDebug,
-          `Preamble:[${runningString.currentToken.preamble}] Token:[${logToken}] Postamble:[${runningString.currentToken.postamble}]`
-        );
-        // Concatinate the last found tokens preable (or full text if none found) to the built string and recursivley call self to ensure full token resolution
-        runningString.outputString = await this.doAsync(runningString.outputString + runningString.currentToken.preamble, options);
-        // A token was found and resolved this iteration — this call's own de-escape step
-        // (below) stays suppressed; the recursive call above already handled de-escaping at
-        // the point the recursion finally bottoms out with no tokens left.
-        deEscape = false;
-      }
-
-      //
-      // Okay, so there is a bug here.  But it shall remain unfixed as it requires time.
-      //
-      // The bug is that is the resolved token string contains a sequence of characters that makes doDeEscapesIfRequired think it sees an escaped special char
-      // the it will de-escape it!!  However, probablity of incidence is currently low.  When/If it does happen (impact could be high!) it can then be fixed.
-      //
-      // IE.
-      //  const encoded = Buffer.from('this/>escaped').toString('base64');
-      //  const decoded = await Detokeniser.doAsync(`<base64;decode;${encoded}>`);
-      //
-      //  decoded would now be "this>escaped".  Should be "this/>escaped".
-      //
-      // `deEscapeOption` (caller-supplied, default true) gates this independently of `deEscape`
-      // (this call's own internal "did I actually resolve a token" tracking) — an explicit
-      // `false` always wins, regardless of whether this call found a token, so a caller
-      // deferring de-escaping to a later pass gets that guarantee unconditionally. See
-      // {@link Detokeniser.DoOptions.deEscape}.
-      // De-escape now only if this call's own loop never found a token (deEscape still
-      // true — the recursion has bottomed out here) AND the caller hasn't deferred it.
-      runningString.outputString = this.doDeEscapesIfRequired(tokenisedString, deEscape && deEscapeOption, runningString.outputString);
-      return runningString.outputString;
+      const resolved = await this.resolveTokens(tokenisedString, options);
+      // Single pass, no recursion — de-escaping runs exactly once here, gated only by the
+      // caller's own preference (defaults to true). See {@link Detokeniser.DoOptions.deEscape}.
+      return this.doDeEscapesIfRequired(options.deEscape ?? true, resolved);
     } catch (err: unknown) {
       // Wrap whatever failed (bad token syntax, a callback throwing, etc.) with the original
       // input string for context, log it, then re-throw as a plain Error.
@@ -414,6 +425,125 @@ export class Detokeniser {
       Log.writeLine(LogLevels.Error, errText);
       throw Error(errText);
     }
+  }
+
+  /**
+   * The resolution engine behind {@link Detokeniser.doAsync} — see
+   * `utils/docs/design/detokeniser-structural-parsing-redesign.md` for the full design
+   * reasoning (this replaces a prior "find the innermost [[/]] pair, resolve it, splice the
+   * result back in, then re-scan the whole combined string for the next one" design, which
+   * had two injection-class bugs: a resolved value's delimiter corrupting a verb's own
+   * argument split, and — the one this method exists to fix — a resolved value's own `[[`/`]]`
+   * corrupting that re-scan, since the scan couldn't tell a verb's literal output apart from
+   * genuine token syntax the test author wrote).
+   *
+   * A single left-to-right pass over the *original* tokenisedString, using a stack of
+   * not-yet-closed `[[` positions:
+   * - An unescaped `[[` pushes a new, empty frame.
+   * - An unescaped `]]` pops the innermost open frame and resolves its accumulated body via
+   *   {@link Detokeniser.doToken} immediately — awaited, so an async callback works exactly as
+   *   before. The resolved value is appended to whichever frame is now on top of the stack (if
+   *   any — that's nesting: the inner token's result becomes literal text inside the still-open
+   *   outer token's own argument string) or to the main output if the stack is now empty (a
+   *   top-level token).
+   * - Every other character — including an escape char not immediately preceding a boundary,
+   *   or one that is but doesn't actually escape anything the scan cares about here — is
+   *   copied straight into whichever buffer is current, unchanged. De-escaping is deliberately
+   *   not interleaved into this scan at all; it happens once, after this method returns, in
+   *   {@link Detokeniser.doDeEscapesIfRequired} — exactly the same separation `doAsync` already
+   *   had.
+   *
+   * The reason this closes off the bug this method replaces: a resolved value is only ever
+   * written into a buffer. It is never handed back to anything that looks for `[[`/`]]` in it —
+   * there is no re-scan step left for it to be misread by, regardless of what characters it
+   * happens to contain.
+   *
+   * Malformed input is tolerated the same way the prior design was, not turned into a new class
+   * of error: a `[[` that's never closed by a matching `]]` anywhere later in the string folds
+   * back into the surrounding text as plain, unresolved literal content once the scan reaches
+   * the end (see the trailing while loop below) — same as the prior design silently leaving an
+   * unterminated `[[` as literal text. A stray, unescaped `]]` with nothing open on the stack to
+   * close is likewise just literal text, not an error.
+   *
+   * A complete, correctly-matched `[[...]]` pair whose verb nothing claims is tolerated the
+   * same way, deliberately, as of the "a third gap" fix in
+   * `utils/docs/design/detokeniser-structural-parsing-redesign.md` — see
+   * {@link UnsupportedTokenError}'s own doc comment for the full reasoning and the trade-off
+   * it accepts.
+   */
+  private static async resolveTokens(tokenisedString: string, options: Detokeniser.DoOptions): Promise<string> {
+    interface OpenFrame {
+      buffer: string;
+    }
+
+    const stack: OpenFrame[] = [];
+    let mainOutput = "";
+
+    // Appends resolved or literal text to whichever buffer is "current" right now — the
+    // innermost still-open frame's, or the main output if nothing is currently open.
+    const appendCurrent = (text: string): void => {
+      if (stack.length > 0) stack[stack.length - 1].buffer += text;
+      else mainOutput += text;
+    };
+
+    let index = 0;
+    while (index < tokenisedString.length) {
+      if (tokenisedString.startsWith(this._startTokenChar, index) && !this.isEscaped(tokenisedString, index)) {
+        // Opens a new frame — everything from here until its own matching `]]` (if any)
+        // accumulates into this frame's own buffer, not the one that was current before it.
+        stack.push({ buffer: "" });
+        index += this._startTokenChar.length;
+        continue;
+      }
+      if (tokenisedString.startsWith(this._endTokenChar, index) && !this.isEscaped(tokenisedString, index)) {
+        if (stack.length === 0) {
+          // No open frame to close — this `]]` was never a real boundary; just literal text.
+          appendCurrent(this._endTokenChar);
+          index += this._endTokenChar.length;
+          continue;
+        }
+        // Closes the innermost open frame — resolve its accumulated body now, then route the
+        // result per this method's own doc comment above.
+        const closedFrame = stack.pop()!;
+        const matchedSpan = this._startTokenChar + closedFrame.buffer + this._endTokenChar;
+        let resolvedValue: string;
+        try {
+          resolvedValue = await this.doToken(closedFrame.buffer, options);
+        } catch (err) {
+          // Nothing claimed this verb at all — see UnsupportedTokenError's own doc comment
+          // for why this one case (and only this one) falls back to literal, unresolved text
+          // instead of propagating. Every other failure (a callback/built-in that recognised
+          // the verb and rejected its arguments) still propagates normally, below.
+          if (!(err instanceof UnsupportedTokenError)) throw err;
+          Log.writeLine(
+            LogLevels.Warning,
+            `No verb matched [${StringUtils.truncateIfNeeded(matchedSpan, LOG_TOKEN_TRUNCATE_LENGTH)}] — ` +
+            `treating it as literal text rather than failing. If this was meant to be a real ` +
+            `token, check the verb name; if it's incidental [[/]] adjacency in unrelated data ` +
+            `(e.g. a JSON nested array), this is expected and no action is needed.`
+          );
+          resolvedValue = matchedSpan;
+        }
+        appendCurrent(resolvedValue);
+        index += this._endTokenChar.length;
+        continue;
+      }
+      // Ordinary character — copy it through to whichever buffer is current, unchanged.
+      appendCurrent(tokenisedString[index]);
+      index++;
+    }
+
+    // Anything still open on the stack never found its own closing `]]` — fold each one back
+    // into whatever's beneath it (or into the main output, for the outermost) as plain literal
+    // text, prefixed with its own, now-meaningless `[[`. Innermost first: that's the order a
+    // real closing sequence would have unwound them in, and appendCurrent (which looks at the
+    // stack's current, shrinking length) routes each fold to the right place automatically.
+    while (stack.length > 0) {
+      const unclosedFrame = stack.pop()!;
+      appendCurrent(this._startTokenChar + unclosedFrame.buffer);
+    }
+
+    return mainOutput;
   }
 
   /**
@@ -432,7 +562,7 @@ export class Detokeniser {
    * "Escaping" section, for why this has to be a local/positional decision rather than a
    * context-free substitution over the whole string.
    */
-  private static doDeEscapesIfRequired(tokenisedString: string, deEscape: boolean, stringToProcess: string): string {
+  private static doDeEscapesIfRequired(deEscape: boolean, stringToProcess: string): string {
 
     ////////////////////////////////////////////////////
     //
@@ -483,804 +613,199 @@ export class Detokeniser {
       }
       processedString = result;
     }
-    // Trace what changed, if anything, for debugging.
-    if (tokenisedString !== processedString) {
-      Log.writeLine(LogLevels.TestDebug, `Processed [${tokenisedString}]\nto [${processedString}]`);
-    }
+    // No logging here — this method's own input/output is a sub-step of whatever doAsync
+    // call is resolving (nested recursion, or a plain de-escape-only pass), and doAsync's own
+    // top-level logging already shows the full before/after for the whole operation. A
+    // separate trace here used to fire on any input≠output, token-resolution included, not
+    // just genuine de-escaping — misleading, and now redundant besides.
     return processedString;
   }
 
-  private static doPreamble(tokenisedString: string): RunningString {
-    // Drill down to the left-most deepest (if nested) token
-    const token = new InnermostToken(tokenisedString, this._startTokenChar, this._endTokenChar, this.EscapeChar);
-
-    // Get all text to the left of any token found in the string passed in.  If no token was found Preamble will contain all text from passed string
-    const outputString = token.preamble;
-    // Package both the located token (or "no token found" state) and the text-so-far together,
-    // ready for the caller's while loop to iterate on.
-    return { currentToken: token, outputString };
-  }
-
-  private static doTokenMain(token: string, options: Detokeniser.DoOptions = {}): DoTokenReturn {
-
-    ////////////////////////////////////////////////////
-    //
-    // Shared dispatch logic, called once per token by doToken: splits the token body into
-    // its tokenName (before the first delimiter) and everything after it, de-escapes that
-    // remainder, then routes to whichever built-in handler loweredTokenName matches. Every
-    // built-in handler, including 'date'/'timezone'/'diff', is fully synchronous and resolved
-    // right here — its result goes straight into doTokenReturn.processedToken. If none of the
-    // built-ins match, processedToken stays undefined and doToken falls through to trying
-    // registered callbacks instead.
-
-    const doTokenReturn: DoTokenReturn = {};
-
-    doTokenReturn.processedToken = undefined;
-
-    // A token body must actually have content — "[[]]" or similar is always an error.
-    if (!token || token === "") {
-      throw new Error("Empty token!  Token must be populated.");
-    }
-    // Split on the first delimiter only: tokenName is the bit before it (e.g. "random",
-    // "date"), postAmble is everything after (that handler's own arguments).
-    const [tokenName, postAmble] = StringUtils.splitRemaining(token, this._delimiter, 2);
-    const loweredTokenName = tokenName.toLowerCase().trim();
-    // De-escape the arguments now — this is the single point where a nested, already-escaped
-    // sub-expression inside a token's own arguments gets resolved before being handed to a
-    // handler, so each handler never has to think about escaping itself.
-    const postAmbleDeEscaped = this.doDeEscapesIfRequired(postAmble, true, postAmble);
-
-    if (typeof doTokenReturn.processedToken === "undefined") {
-      switch (loweredTokenName) {
-        case "random":
-          // 'random' needs at least a type and (usually) a length/format argument.
-          if (StringUtils.isBlank(postAmbleDeEscaped)) throw new Error(`Random token [${token}] needs at least 2 parts (IE. {{random;type[;<length>]}} etc.)`);
-          doTokenReturn.processedToken = this.doRandomToken(postAmbleDeEscaped);
-          break;
-        case "setting":
-          {
-            // 'setting' needs its JSON-ish parameter block (processEnvName/etc).
-            if (StringUtils.isBlank(postAmbleDeEscaped)) throw new Error(`Setting token [${token}] needs at least 2 parts (IE. {{setting;processEnvName: "TEST_LOG_TO_CONSOLE")`);
-            doTokenReturn.processedToken = this.doSettingToken(postAmbleDeEscaped, options);
-            break;
-          }
-        case "mockintercepts":
-          // 'mockintercepts' needs a JSONPath expression to harvest from intercepted requests.
-          if (StringUtils.isBlank(postAmbleDeEscaped)) throw new Error(`Request token [${token}] needs 2 parts {{mockintercepts;JSONPath}}`);
-          doTokenReturn.processedToken = this.doMockRequests(postAmbleDeEscaped);
-          break;
-        case "jwt":
-          // 'jwt' needs at least a payload (signature/options are optional, see doJWTToken).
-          if (StringUtils.isBlank(postAmbleDeEscaped))
-            throw new Error(`JWT token [${token}] needs at least 2 parts (IE. {{jwt;payload[;signature[;options]]}} etc.)`);
-          doTokenReturn.processedToken = this.doJWTToken(postAmbleDeEscaped);
-          break;
-        case "base64":
-          // aha, we actuall need three parts <base64;encode|decode;<string>>
-          // Split off the direction ('encode'/'decode') from the value to convert; only
-          // proceed to doBase64 if the direction is actually one of those two literals.
-          if (!StringUtils.isBlank(postAmbleDeEscaped)) {
-            const [direction, value] = StringUtils.splitRemaining(postAmbleDeEscaped, this._delimiter, 2);
-            if (direction == "encode" || direction == "decode") {
-              doTokenReturn.processedToken = this.doBase64(value, direction);
-              break;
-            }
-          }
-          // Either no postamble at all, or a direction other than encode/decode — malformed.
-          throw new Error(`BASE64 token [${token}] needs 3 parts (IE. {{base64;encode|decode;value}})`);
-        case "date":
-          // 'date' needs at least an offset verb and a format (doDateToken enforces the
-          // exact shape, including the optional 3rd IANA-zone part) — this just guards
-          // against a completely empty body, same as every other built-in above.
-          if (StringUtils.isBlank(postAmbleDeEscaped))
-            throw new Error(`Date token [${token}] needs 2 or 3 parts {{date;<offset>;<format>[;<ianaZone>]}}`);
-          doTokenReturn.processedToken = this.doDateToken(postAmbleDeEscaped);
-          break;
-        case "timezone":
-          // 'timezone' needs exactly the IANA zone name to validate.
-          if (StringUtils.isBlank(postAmbleDeEscaped)) throw new Error(`Timezone token [${token}] needs an IANA zone name (IE. {{timezone;Europe/London}})`);
-          doTokenReturn.processedToken = this.doTimezoneToken(postAmbleDeEscaped);
-          break;
-        case "diff":
-          // 'diff' needs exactly two IANA zone names — doDiffToken enforces the exact count.
-          if (StringUtils.isBlank(postAmbleDeEscaped)) throw new Error(`Diff token [${token}] needs 2 IANA zone names (IE. {{diff;<zoneA>;<zoneB>}})`);
-          doTokenReturn.processedToken = this.doDiffToken(postAmbleDeEscaped);
-          break;
-        // default: genuinely unrecognised token name — processedToken stays undefined, so
-        // the caller falls through to trying registered callbacks, and ultimately to an
-        // "Unsupported token" error if none of those match either.
+  /**
+   * Splits a token body into verb / qualifier / args, for doToken's dispatch below. See this
+   * class's own "Dispatch"/"Qualifier parsing" doc sections above for the exact rules — in
+   * short: the verb ends at the first `(` or `|`, whichever comes first; a `(` starts a
+   * qualifier, ending at the first unescaped `)` (no nesting); everything after the verb
+   * section is `args`, de-escaped the same way `[[`/`]]` boundaries are.
+   */
+  private static parseVerbSection(token: string): { verb: string; rawVerb: string; qualifier: string | undefined; args: string } {
+    // Scan once for whichever comes first: a qualifier-opening "(" or the plain delimiter.
+    let qualifierOpenIndex = -1;
+    let delimiterIndex = -1;
+    for (let i = 0; i < token.length; i++) {
+      if (token[i] === "(") {
+        qualifierOpenIndex = i;
+        break;
+      }
+      if (token[i] === this._delimiter) {
+        delimiterIndex = i;
+        break;
       }
     }
-    return doTokenReturn;
+
+    if (qualifierOpenIndex === -1) {
+      // No qualifier — verb is everything up to the first delimiter, or the whole token if
+      // there's no delimiter either (a bare verb with no args at all).
+      const verbText = delimiterIndex === -1 ? token : token.substring(0, delimiterIndex);
+      const args = delimiterIndex === -1 ? "" : token.substring(delimiterIndex + 1);
+      return {
+        verb: verbText.toLowerCase().trim(),
+        rawVerb: verbText,
+        qualifier: undefined,
+        args: this.doDeEscapesIfRequired(true, args),
+      };
+    }
+
+    // Has a qualifier — verb is the text before the "(". Scan forward for the first
+    // unescaped ")"; everything between is the qualifier content, taken literally (no
+    // nesting — an inner "(" has no special meaning, same rule as e.g. random|from(...)).
+    const verbText = token.substring(0, qualifierOpenIndex);
+    let qualifier = "";
+    let i = qualifierOpenIndex + 1;
+    let closed = false;
+    while (i < token.length) {
+      if (token[i] === this.EscapeChar && i + 1 < token.length) {
+        // Escaped character — literal, never ends the qualifier.
+        qualifier += token[i + 1];
+        i += 2;
+        continue;
+      }
+      if (token[i] === ")") {
+        closed = true;
+        i++;
+        break;
+      }
+      qualifier += token[i];
+      i++;
+    }
+    if (!closed) {
+      throw new Error(`Unterminated '(' in verb qualifier of token [${token}] — expected a closing ')'.`);
+    }
+    const rawVerb = token.substring(0, i);
+    // The character right after the qualifier's closing ")" must be the delimiter, or
+    // nothing (end of string, no args) — anything else is malformed.
+    let args = "";
+    if (i < token.length) {
+      if (token[i] !== this._delimiter) {
+        throw new Error(
+          `Malformed token [${token}] — expected [${this._delimiter}] or end of string immediately after the verb qualifier, got [${token[i]}].`
+        );
+      }
+      args = token.substring(i + 1);
+    }
+    return {
+      verb: verbText.toLowerCase().trim(),
+      rawVerb,
+      qualifier,
+      args: this.doDeEscapesIfRequired(true, args),
+    };
   }
 
+  /**
+   * Tries each handler in `handlers` — the user-registered callbacks for one specific verb —
+   * in **reverse** order (most-recently-registered first, see {@link Detokeniser.addCallback}'s
+   * own doc comment for why), awaiting each regardless of whether it's sync or async, and
+   * returning the first non-`undefined` result.
+   *
+   * A handler throwing here is logged and treated the same as "returned undefined" — one
+   * unexpected bug in a user-registered callback shouldn't block every other callback (or the
+   * built-in) registered for the same verb from getting a turn. This is deliberately NOT used
+   * for the built-in handler itself (see {@link Detokeniser.doToken}, which calls it directly)
+   * — a built-in throwing means it's already recognised the verb as its own and found the
+   * arguments invalid, which is a genuine, specific validation error that must propagate
+   * directly, not get swallowed into a generic "Unsupported token" message.
+   */
+  private static async tryHandlers(
+    handlers: Array<Detokeniser.Callback> | undefined,
+    context: Detokeniser.CallbackContext
+  ): Promise<string | undefined> {
+    if (!handlers) return undefined;
+    for (let index = handlers.length - 1; index >= 0; index--) {
+      try {
+        const result = await Promise.resolve(handlers[index](context));
+        if (!Utils.isNullOrUndefined(result)) return result;
+      } catch (e) {
+        Log.writeLine(
+          LogLevels.Error,
+          `Error processing callback (ignoring and setting response to undefined): ${Utils.errorMessage(e)}`
+        );
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolves a single token body — see the main `////` comment inside for the resolution
+   * mechanics. On success, logs one `TestDebug` line pairing this specific token's own raw
+   * text with its own resolved value: `Processed [<token, truncated to
+   * {@link LOG_TOKEN_TRUNCATE_LENGTH}>] to [<result, truncated to the same length>]` — this is
+   * what gives a multi-token string one line per token (resolved innermost-first, so a nested
+   * token's own line always precedes its parent's), rather than {@link Detokeniser.doAsync}
+   * logging one undifferentiated dump of the whole input and the whole output. Logs nothing on
+   * failure — there's no resolved value yet to pair the token with; the existing
+   * `Detokeniser.doAsync`-wrapping error log (in {@link Detokeniser.doResolve}'s catch
+   * block) already covers that path.
+   */
   private static async doToken(token: string, options: Detokeniser.DoOptions = {}): Promise<string> {
 
     ////////////////////////////////////////////////////
     //
-    // Resolves a single token body: try the shared built-in dispatch first (doTokenMain —
-    // every built-in, including 'date'/'timezone'/'diff', resolves fully synchronously
-    // there), then — if still unresolved — try each registered callback in order, awaiting
-    // it regardless of whether it's sync or async, and finally throw if nothing recognised
-    // the token at all. A callback throwing is logged and treated as "didn't resolve it"
-    // rather than propagated, letting the "Unsupported token" error below give the final,
-    // clearer verdict instead.
+    // Resolves a single token body: parse verb/qualifier/args once (parseVerbSection), try
+    // every user-registered callback for that verb (most-recently-registered first, so a
+    // consumer can override a built-in), then fall through to the single built-in handler for
+    // that verb (if any), and finally throw if nothing matched at all. See tryHandlers' own
+    // doc comment for why user-callback errors are swallowed but a built-in's are not.
 
-    const doTokenReturn = this.doTokenMain(token, options);
-    let processedToken: string | undefined = doTokenReturn.processedToken;
-    //
-    // If token still not been processed itterate through the callbacks, breaking as soon as it is processed.  Dirty
-    // ucky loop. But it works....  If you know a sexier way of doing it please change!!
-    //
-    try {
-      if (Utils.isNullOrUndefined(processedToken)) {
-        if (typeof this._callbacks != "undefined") {
-          // Try each registered callback in turn (sync or async — Promise.resolve wraps
-          // either uniformly), stopping as soon as one actually resolves the token.
-          for (const callback of this._callbacks) {
-            processedToken = await Promise.resolve(callback(token));
-            if (!Utils.isNullOrUndefined(processedToken)) break;
-          }
-        }
-      }
-    } catch (e) {
-      // A callback throwing here is swallowed, not propagated — logged as an error and
-      // treated the same as "returned undefined", letting the "Unsupported token" check
-      // below produce the final, clearer error instead.
-      Log.writeLine(
-        LogLevels.Error,
-        `Error processing async callback (ignoring and setting response to undefined):${(e as Error)?.message ?? "<Unknown Error>"}}`
-      );
-      processedToken = undefined;
+    // A token body must actually have content — "[[]]" or similar is always an error. Checked
+    // once, centrally, here — not per-handler — since it applies regardless of which verb (if
+    // any) the token would otherwise turn out to name.
+    if (!token || token === "") {
+      throw new Error("Empty token!  Token must be populated.");
     }
+
+    const { verb, rawVerb, qualifier, args } = this.parseVerbSection(token);
+    const context: Detokeniser.CallbackContext = { verb, rawVerb, qualifier, args, delimiter: this.delimiter, options };
+
+    let processedToken = await this.tryHandlers(this._userCallbacks?.get(verb), context);
     if (Utils.isNullOrUndefined(processedToken)) {
-      // Nothing — no built-in, no callback — ever resolved this token.
-      throw new Error(`Unsupported token [${StringUtils.splitRemaining(token, this._delimiter, 2)[0]}]`);
-    } else {
-      return processedToken as string;
+      const builtinHandler = this._builtinCallbacks.get(verb);
+      if (builtinHandler) {
+        // Call the built-in directly, not through tryHandlers — any error it throws
+        // propagates uncaught, per tryHandlers' own doc comment.
+        processedToken = await Promise.resolve(builtinHandler(context));
+      }
     }
-  }
 
-  private static doSettingToken(tokenBody: string, options: Detokeniser.DoOptions = {}): string | undefined {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves a `[[setting|...]]` token: the token body is bare `name: value` pairs (not
-    // wrapped in braces, e.g. `processEnvName: "MY_VAR"`), so it's wrapped into a JSON object
-    // literal, validated, parsed, then handed to Utils.getSetting — which does the actual
-    // process-env → npm-config → context-parameter → default resolution — and the resolved
-    // value is stringified for substitution back into the token's surrounding text.
-
-    // Wrap the bare 'name: value, ...' body into a proper JSON object literal.
-    const bodyJSON = `{${tokenBody}}`;
-    // Validate it actually parses as JSON before attempting to use it — gives a much clearer,
-    // setting-specific error than whatever JsonUtils.parse itself would throw.
-    if (!JsonUtils.isJson(bodyJSON, true)) {
-      const errText = `Token 'Setting'.\nExpected: parameters in name: value format (IE. ${this._startTokenChar}setting;processEnvName: "MY_SETTING"${this._endTokenChar}\nToken was: ${this._startTokenChar}setting;${tokenBody}${this._endTokenChar}\n\nValid Setting parameters include;\n  processEnvName - Name of process env variable\n  npmPackageConfigName - Name of NPM config var\n  profileParameterName - Name of Cucumber profile parameter\n  defaultValue - default value if cannot be found`;
-      Log.logErrorAndThrow(errText);
-    }
-    // Resolve the setting — process env, then npm config, then context parameters (if any
-    // were supplied via options.contextParameters), then the parsed object's own defaultValue.
-    const { value } = Utils.getSetting(
-      LogLevels.TestInformation,
-      "From Detokeniser",
-      JsonUtils.parse(bodyJSON, true),
-      options.contextParameters ? { parameters: options.contextParameters } : undefined
-    );
-    if (Utils.isNullOrUndefined(value)) {
-      // Nothing resolved (and no default was given) — pass the missing value straight
-      // through rather than coercing it into the string "undefined"/"null".
-      return value as undefined;
+    if (Utils.isNullOrUndefined(processedToken)) {
+      // Nothing — no user callback, no built-in — ever resolved this token. A dedicated
+      // error type, not a plain Error, so resolveTokens can recognise this specific case
+      // (nothing claims the verb at all) apart from every other way a token can fail (a
+      // callback/built-in recognised the verb and rejected its arguments) without relying on
+      // string-matching this message, which callers must never do either — see
+      // UnsupportedTokenError's own doc comment for why this distinction exists at all.
+      throw new UnsupportedTokenError(`Unsupported token [${verb}]`);
     } else {
-      // Objects are stringified as JSON; everything else is coerced to its plain string form.
-      return typeof value === 'object' ? JSON.stringify(value) : String(value);
+      // One line per token actually resolved — see this method's own doc comment above.
+      const rawToken = `${this._startTokenChar}${token}${this._endTokenChar}`;
+      Log.writeLine(
+        LogLevels.TestDebug,
+        `Processed [${StringUtils.truncateIfNeeded(rawToken, LOG_TOKEN_TRUNCATE_LENGTH)}] to [${StringUtils.truncateIfNeeded(processedToken, LOG_TOKEN_TRUNCATE_LENGTH)}]`
+      );
+      return processedToken;
     }
   }
 
   /**
-   * Base64-encodes or decodes a string.
-   *
-   * This is the underlying handler for `[[base64|encode|...]]` and `[[base64|decode|...]]` tokens
-   * but is also exposed for direct use.
-   *
-   * @param original - The string to encode or decode
-   * @param direction - `"encode"` to base64-encode; `"decode"` to base64-decode
-   * @returns The encoded or decoded string
-   * @throws If the conversion fails (e.g. invalid base64 input for decode)
-   *
-   * @example
-   * Detokeniser.doBase64('Hello World', 'encode');      // → 'SGVsbG8gV29ybGQ='
-   * Detokeniser.doBase64('SGVsbG8gV29ybGQ=', 'decode'); // → 'Hello World'
+   * Determines whether the boundary sequence (`[[` or `]]`) starting at `positionToTest` in
+   * `fullString` is escaped, by counting the run of consecutive escape characters immediately
+   * before it: an odd count means the boundary itself is escaped (one escape char "consumed"
+   * by it, the rest pairing off), an even count means it's not (the run is just literal
+   * escaped-escape-char pairs with nothing left over to escape the boundary). Used by
+   * {@link Detokeniser.resolveTokens} to decide whether a candidate `[[`/`]]` is real token
+   * syntax or literal text — de-escaping itself (removing the `/`) happens later, once, in
+   * {@link Detokeniser.doDeEscapesIfRequired}; this method only ever decides, never mutates.
    */
-  public static doBase64(original: string, direction: "encode" | "decode"): string {
-    // original must actually be a string — fail fast and clearly if not.
-    Utils.assertType(original, "string", "Detokeniser.doBase64", "original");
-    // direction must be exactly one of the two recognised literals.
-    if (direction !== "encode" && direction !== "decode") {
-      const errText = `Cannot Detokeniser.doBase64 as [direction] must be 'encode' or 'decode'. Is [${Utils.describeValue(direction)}]`;
-      Log.logErrorAndThrow(errText);
-    }
-    try {
-      // Encode: treat original as UTF-8 text, output base64. Decode: treat original as
-      // base64, output the UTF-8 text it represents.
-      return direction == "encode" ? Buffer.from(original).toString("base64") : Buffer.from(original, "base64").toString();
-    } catch (err) {
-      // E.g. malformed base64 input on decode — wrap with context and throw.
-      const errText = `Converting:\n[${original}]\n  ${direction == "encode" ? "to" : "from"} base64:\n {${Utils.errorMessage(err)}}`;
-      Log.logErrorAndThrow(errText);
-    }
-  }
-
-  //
-  //  So, this has been created quickly with little/no checking/testing.  Lots and lots of error handling needs adding or testers will get
-  //  errors/fails they have no idea how to fix!!!!
-  //
-  private static doJWTToken(tokenBody: string): string {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves a `[[jwt|payload[|signature[|options]]]]` token: splits into up to 3 parts
-    // (payload, signature, options) on the delimiter, and calls Utils.createJWT with
-    // whichever of those were actually supplied — signature defaults to a dummy placeholder
-    // if omitted entirely.
-
-    Log.writeLine(LogLevels.TestDebug, `JWT token [${tokenBody}]`);
-    const typeAndLengthOrFormat: string[] = StringUtils.splitRemaining(tokenBody, this._delimiter, 3);
-    if (typeAndLengthOrFormat.length == 3) {
-      // payload, signature, and options were all given.
-      return Utils.createJWT(typeAndLengthOrFormat[0], typeAndLengthOrFormat[1], typeAndLengthOrFormat[2]);
-    } else if (typeAndLengthOrFormat.length == 2) {
-      // payload and signature given, no options.
-      return Utils.createJWT(typeAndLengthOrFormat[0], typeAndLengthOrFormat[1]);
-    } else {
-      // Only the payload was given — sign with a fixed placeholder signature.
-      return Utils.createJWT(typeAndLengthOrFormat[0], "DummySignature");
-    }
-  }
-
-  private static doMockRequests(jsonPath: string): string {
-    //
-    // NOTE.  This is MockUtils only at the moment.  When playwright is brought in to the library this MUST be made generic so user can harvest from Mock intercepts,
-    // whether MSW OR Playwright.
-    //
-
-    // Nothing to harvest from if no requests have been intercepted at all.
-    if (!MockUtils.interceptedRequests || MockUtils.interceptedRequests.length <= 0) {
-      const errMessage = "No Mock Intercepted requests to harvest from!?";
-      Log.logErrorAndThrow(errMessage);
-    }
-
-    // Find whatever node(s) the JSONPath expression matches across all intercepted requests.
-    const jsonProperties = JsonUtils.getPropertiesMatchingPath(MockUtils.interceptedRequests, jsonPath);
-    if (jsonProperties.length != 1) {
-      // Deliberately strict: a token must resolve to exactly one value — zero or multiple
-      // matches are both treated as an error rather than guessing which one was meant.
-      throw new Error(`Expected path (${jsonPath}) to match exactly one JSON node.  However, path matched ${jsonProperties.length} nodes!`);
-    } else {
-      return jsonProperties[0].value as string;
-    }
-  }
-
-  /**
-   * Extracts the content inside the first set of parentheses in `input`, respecting the escape char.
-   * An escaped `)` (i.e. `/)`) is treated as a literal `)` and does not end the content.
-   * @example parseParenContent("from(abc/))") → "abc)"
-   * @example parseParenContent("from(xyz/[[)") → "xyz[["  (with default escape char `/`)
-   */
-  private static parseParenContent(input: string): string {
-    // No opening paren at all — nothing to extract.
-    const openParen = input.indexOf("(");
-    if (openParen === -1) return "";
-    let result = "";
-    // Start scanning right after the opening paren.
-    let i = openParen + 1;
-    while (i < input.length) {
-      if (input[i] === this.EscapeChar && i + 1 < input.length) {
-        // Escaped character — take the character that follows the escape char literally
-        // (e.g. `/)` → literal `)`) and skip both; it never ends the content.
-        result += input[i + 1];
-        i += 2;
-      } else if (input[i] === ")") {
-        // Unescaped closing paren — this is the real end of the content.
-        break;
-      } else {
-        // Ordinary character — copy it through as-is.
-        result += input[i];
-        i++;
-      }
-    }
-    return result;
-  }
-
-  private static doRandomToken(tokenBody: string): string {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves a `[[random|<verb>|<lengthOrFormat>]]` token. The verb selects one of three
-    // distinct shapes: date(fromEpoch,toEpoch) → a random epoch formatted per the second
-    // part; float(min,max) → a random float truncated/formatted to N decimal places; or one
-    // of the character-set verbs (letters/digits/etc, or from(<chars>)) → a random string of
-    // the given length built by repeatedly picking a random character from that set.
-
-    const typeAndLengthOrFormat: string[] = StringUtils.splitRemaining(tokenBody, this._delimiter, 2);
-    let result = "";
-    let select = "";
-    const verb: string = typeAndLengthOrFormat[0].toLowerCase().trim();
-
-    if (verb.startsWith("date(")) {
-      // date(fromEpoch,toEpoch) — generate a random epoch in that range, then format it
-      // per the second part (or leave it as a raw epoch string if the format is "epoch").
-      const randomDate = this.doRandomDate(verb.substring(verb.indexOf("(") + 1, verb.indexOf(")")));
-
-      result = typeAndLengthOrFormat[1].toLowerCase() === "epoch" ? "" + randomDate : format(randomDate, typeAndLengthOrFormat[1]);
-    } else if (verb.startsWith("float(")) {
-      // float(min,max) — the second part is the number of decimal places, not a date format.
-      // ToDo: Current format is only for number of decimals.  However in future could be precision,decimals if needed (IE. {random,float(4000,8000),3,4} precision 3 decimals 4...), defaulting
-      //       to decimal places if only a single number given (then change would be non-breaking)....
-      if (isNaN(parseInt(typeAndLengthOrFormat[1])))
-        throw `Invalid Float format. Expect {{random.float(min;max),<number of decimals>}}. Format was: [${typeAndLengthOrFormat[1]}]`;
-      const numberOfDecimalPlaces = parseInt(typeAndLengthOrFormat[1]);
-      const powerDPs = Math.pow(10, numberOfDecimalPlaces);
-      // Truncate (not round) to the requested number of decimal places, then format with
-      // exactly that many digits — guarantees a fixed-width decimal part, not a varying one.
-      result = (Math.trunc(this.doRandomFloat(verb.substring(verb.indexOf("(") + 1, verb.indexOf(")"))) * powerDPs) / powerDPs).toFixed(numberOfDecimalPlaces);
-    } else {
-      // Character-set verbs: either a custom from(<chars>) set, or one of the fixed named
-      // sets below. Either way, 'select' ends up holding the pool of characters to pick from.
-      if (verb.startsWith("from(")) {
-        select = this.parseParenContent(typeAndLengthOrFormat[0]);
-      } else {
-        switch (verb) {
-          case "letters":
-            select = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-            break;
-          case "lowercaseletters":
-            select = "abcdefghijklmnopqrstuvwxyz";
-            break;
-          case "uppercaseletters":
-            select = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-            break;
-          case "digits":
-            select = "0123456789";
-            break;
-          case "alphanumerics":
-            select = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890";
-            break;
-          default:
-            // Verb wasn't a recognised named set, and didn't start with "from(" either.
-            throw `Unrecognised random Type [${typeAndLengthOrFormat[0]}] - Expect letters, lowercaseletters, uppercaseletters digits or alphanumerics`;
-        }
-      }
-      // Second part must be a valid non-negative integer length, regardless of which
-      // character set was selected above.
-      if (isNaN(parseInt(typeAndLengthOrFormat[1])) || parseInt(typeAndLengthOrFormat[1]) < 0)
-        throw `Invalid length part in Random token {{random;<type>;<length>}}. Length was: [${typeAndLengthOrFormat[1]}]`;
-      // Build the result by picking `length` characters from the pool, independently at
-      // random each time (so repeats within the result are allowed).
-      for (let count = 0; count < parseInt(typeAndLengthOrFormat[1]); count++) {
-        result += select[Utils.getRandomInt(0, select.length - 1)];
-      }
-    }
-    return result;
-  }
-
-  private static doDateTokenPreamble(date: number, tokenBody: string): DoTokenPreambleReturn {
-
-    ////////////////////////////////////////////////////
-    //
-    // Setup for doDateToken: splits tokenBody into its offset/verb part, its format part,
-    // and an optional 3rd raw-IANA-zone part; validates that zone (if given) against the
-    // runtime's own timezone database; extracts the verb name and its parenthesised params
-    // (if any) from the offset part; and bundles up every verb-specific error message string
-    // up front so each calling branch can just reference the one it needs rather than
-    // building it inline.
-
-    // Split into [offsetExpression, format, ianaZone?] — e.g. ["addDays(5)", "dd-MM-yyyy"] or
-    // ["addDays(5)", "dd-MM-yyyy", "Europe/London"]. The zone is genuinely optional — omitting
-    // it means "format in local time", same as before this token supported zones at all.
-    const parts = StringUtils.splitRemaining(tokenBody, this._delimiter, 3);
-    const offsetAndFormat = [parts[0], parts[1]];
-    const ianaZone = parts[2];
-
-    // Must have both an offset expression and a format — the 3rd (zone) part is optional.
-    if (parts.length < 2) throw "Date token does not have a format parameter; example: {date;today;dd-MM-yyyy}";
-    // A zone was actually supplied — validate it now, up front, rather than letting a typo
-    // surface later as a confusing date-fns formatting error.
-    if (ianaZone) this.assertValidIANAZone(ianaZone, "Date token's timezone");
-
-    Log.writeLine(LogLevels.TestDebug, `Time now is [${date}] (Epoch) and we are in [${ianaZone ?? "<local time>"}]`);
-
-    return {
-      offsetAndFormat: offsetAndFormat,
-      // verb is the offset expression's name only — if it has parens (e.g. "addDays(5)"),
-      // strip everything from "(" onward; otherwise the whole offset expression is the verb
-      // (e.g. "today").
-      verb: (offsetAndFormat[0].includes("(") && offsetAndFormat[0].endsWith(")") ? offsetAndFormat[0].split("(")[0] : offsetAndFormat[0]).toLowerCase().trim(),
-      // params is whatever's between the parens (e.g. "5" from "addDays(5)"), or undefined
-      // if the offset expression has no parens at all (e.g. "today").
-      params:
-        offsetAndFormat[0].includes("(") && offsetAndFormat[0].endsWith(")")
-          ? ((x: string) => {
-            // Drop the trailing ")" that split("(")[1] leaves behind.
-            return x.substring(0, x.length - 1);
-          })(offsetAndFormat[0].split("(")[1])
-          : undefined,
-
-      // Pre-built, verb-specific error messages — each referencing offsetAndFormat[0] so the
-      // message always reflects what was actually typed, computed once here rather than
-      // separately at each call site below.
-      errParseDateOffset: "Invalid Active Date offset.  Expect AddYears(n) AddMonths(n) or AddDays(n)",
-      errInvalidEpoch: "Invalid Epoch offset.  Expect number of milliseconds since 1/1/1970",
-      errRandomParams: `Invalid Random params ([${offsetAndFormat[0]}]).  Expect Random(<start date>,<end date>).  Example: {date;random(1708990784000,1701360784000);yyy-MM-dd}`,
-      errFollowingDayParams: `FollowingDay requires epoch and day name.  IE. FollowingDay(123456,wednesday)  Got ${offsetAndFormat[0]}`,
-      errInvalidDateVerb: `Invalid date verb [${offsetAndFormat[0]}].  Need: Random, Today, Now, Yesterday, Tomorrow, AddYears(n) etc... EG {date;AddDays(5);yyyy-MM-dd}`,
-      ianaZone: ianaZone,
-    };
-  }
-
-  private static doDateTokenPostamble(offsetAndFormat: string[], date: number, ianaZone: string | undefined): string {
-
-    ////////////////////////////////////////////////////
-    //
-    // Final-formatting step for doDateToken, once the offset-resolved epoch (date) is known:
-    // the format part is either the special "epoch"/"second-epoch" values (returning the raw
-    // epoch, not a formatted string), or a real date-fns format string — formatted in the
-    // given IANA zone if one was given, otherwise formatted in local time.
-
-    // Special case: caller wants the raw millisecond epoch, not a formatted date string.
-    if (offsetAndFormat[1].toLowerCase() === "epoch") {
-      return date.toString();
-    }
-
-    // Special case: caller wants the epoch in whole seconds, not milliseconds.
-    if (offsetAndFormat[1].toLowerCase() === "second-epoch") {
-      return Math.floor(date / 1000).toString();
-    }
-
-    try {
-      // Format in the given zone if one was supplied, otherwise local time.
-      const processedDate = ianaZone ? formatInTimeZone(date, ianaZone, offsetAndFormat[1]) : format(date, offsetAndFormat[1]);
-      Log.writeLine(LogLevels.TestDebug, `Formatted [${offsetAndFormat[0]}] date [${date}] (Epoch) with [${offsetAndFormat[1]}] to: [${processedDate}]`);
-      return processedDate;
-    } catch (err) {
-      // date-fns format() throws on a malformed format string — wrap with the date/format
-      // that caused it for context, including the original stack trace.
-      const errorText = `Error formatting date [${date}] with format string[${offsetAndFormat[1]}]: ${(err as Error)?.message ?? "<Unknown error>"}}`;
-      throw new Error(errorText + "/r" + ((err as Error)?.stack ?? ""));
-    }
-  }
-
-  private static doDateTokenVerb(date: number, dateTokenPrep: DoTokenPreambleReturn): number {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves every date-offset verb this token supports — the whole thing is fully
-    // synchronous now that business-day/public-holiday-aware verbs have been removed (that
-    // kind of date math needs an external holiday calendar, which belongs in a consumer's own
-    // callback, not baked into this built-in).
-
-    let returnDate: number = date;
-    switch (dateTokenPrep.verb) {
-      case "random": {
-        // random(fromEpoch,toEpoch) — pick a random epoch within that inclusive range.
-        if (Utils.isNullOrUndefined(dateTokenPrep.params)) {
-          throw new Error(dateTokenPrep.errRandomParams);
-        } else {
-          returnDate = this.doRandomDate(dateTokenPrep.params as string);
-        }
-        break;
-      }
-      case "today":
-      case "now":
-        // No offset at all — use the current date/time passed in as-is.
-        break;
-      case "yesterday":
-        returnDate = addDays(date, -1).getTime();
-        break;
-      case "tomorrow":
-        returnDate = addDays(date, 1).getTime();
-        break;
-      case "addyears":
-        returnDate = addYears(date, this.getParsedDateOffset(dateTokenPrep.params, dateTokenPrep.errParseDateOffset)).getTime();
-        break;
-      case "addmonths":
-        returnDate = addMonths(date, this.getParsedDateOffset(dateTokenPrep.params, dateTokenPrep.errParseDateOffset)).getTime();
-        break;
-      case "adddays":
-        returnDate = addDays(date, this.getParsedDateOffset(dateTokenPrep.params, dateTokenPrep.errParseDateOffset)).getTime();
-        break;
-      case "addhours":
-        returnDate = addHours(date, this.getParsedDateOffset(dateTokenPrep.params, dateTokenPrep.errParseDateOffset)).getTime();
-        break;
-      case "addminutes":
-        returnDate = addMinutes(date, this.getParsedDateOffset(dateTokenPrep.params, dateTokenPrep.errParseDateOffset)).getTime();
-        break;
-      case "followingday": {
-        // followingDay(epoch,dayName) — find the next occurrence of the named weekday on or
-        // after the given epoch (no weekend/public-holiday skipping — that's the async-only
-        // followingWorkingDay variant instead).
-        if (Utils.isNullOrUndefined(dateTokenPrep.params)) {
-          throw new Error(dateTokenPrep.errFollowingDayParams);
-        } else {
-          const currentAndDay = (dateTokenPrep.params as string).split(",");
-          if (currentAndDay.length != 2) throw new Error(dateTokenPrep.errFollowingDayParams);
-          returnDate = this.getFollowingDay(
-            this.getParsedDateOffset(currentAndDay[0], dateTokenPrep.errInvalidEpoch),
-            currentAndDay[1].toLowerCase(),
-            dateTokenPrep.errFollowingDayParams
-          ).getTime();
-        }
-        break;
-      }
-      default:
-        // Not one of the named verbs above — check if it's a fixed "yyyy-MM-dd" literal date
-        // instead (e.g. the verb itself IS the date, with no offset applied at all).
-        if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(dateTokenPrep.verb)) {
-          // we have a fixed date.  User must be wanted to just format a date....
-          const date = dateTokenPrep.verb.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-          // Pull year/month/day out of the regex match; month is 0-indexed for Date.UTC.
-          const year = Number((date as Array<string>)[1]) ?? 0;
-          const month = (Number((date as Array<string>)[2]) ?? 0) - 1;
-          const day = Number((date as Array<string>)[3]) ?? 0;
-          Log.writeLine(LogLevels.TestDebug, `Date got fixed date:- >>${year}<<>>${month}<<>>${day}<<`);
-          // Construct as midnight UTC on that date.
-          const fullEpoch = new Date(Date.UTC(year, month, day, 0, 0, 0));
-          Log.writeLine(LogLevels.TestDebug, `... which is:- >>${fullEpoch}<<`);
-
-          returnDate = fullEpoch.getTime();
-        } else {
-          // Neither a recognised verb nor a fixed-date literal — genuinely invalid.
-          throw dateTokenPrep.errInvalidDateVerb;
-        }
-    }
-    return returnDate;
-  }
-
-  private static doDateToken(tokenBody: string): string {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolver for `[[date|...]]` tokens: starts from the current time, resolves the verb's
-    // offset via the preamble/verb helpers, then formats the result. Fully synchronous — no
-    // verb this token supports needs to await anything external.
-
-    let date = new Date().getTime();
-    const dateTokenPrep = this.doDateTokenPreamble(date, tokenBody);
-    date = this.doDateTokenVerb(date, dateTokenPrep);
-    return this.doDateTokenPostamble(dateTokenPrep.offsetAndFormat, date, dateTokenPrep.ianaZone);
-  }
-
-  private static getFollowingDay(currentDateEpoch: number, requiredDayOfTheWeek: string, errorString: string): Date {
-    const dayName = requiredDayOfTheWeek.toLowerCase();
-    // Resolve the requested day name to an index 0 (Monday) .. 6 (Sunday).
-    const requiredDayOfWeek = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].findIndex((item) => {
-      if (item == dayName) return true;
-      return false;
-    });
-    // Day name didn't match any of the 7 recognised names at all.
-    if (requiredDayOfWeek == -1) throw new Error(errorString);
-    // getUTCDay() returns 0 (Sunday) .. 6 (Saturday); subtracting 1 re-bases it to the same
-    // Monday-first 0..6 scale used by requiredDayOfWeek above (Sunday wraps to -1 here,
-    // which the "actualDayOfWeek < requiredDayOfWeek" branch below still handles correctly
-    // since -1 is less than every requiredDayOfWeek value 0..6).
-    const actualDayOfWeek = new Date(currentDateEpoch).getUTCDay() - 1;
-    if (actualDayOfWeek < requiredDayOfWeek) {
-      // Target day hasn't happened yet this week — just add the difference.
-      return addDays(currentDateEpoch, requiredDayOfWeek - actualDayOfWeek);
-    } else {
-      // Target day already passed (or is today) this week — wrap to next week.
-      return addDays(currentDateEpoch, requiredDayOfWeek + 7 - actualDayOfWeek);
-    }
-  }
-
-  private static getParsedDateOffset(numString: string | undefined, errorMessage: string): number {
-    // No params string supplied at all (e.g. a verb like "addDays" with no parens/number).
-    if (Utils.isNullOrUndefined(numString)) {
-      throw `${errorMessage} Got [No Params!]`;
-    } else {
-      // Trim whitespace, then require it to parse as a whole number.
-      const offsetValue = parseInt(numString?.trim() as string);
-      if (isNaN(offsetValue)) throw `${errorMessage} Got [${numString?.trim() as string}]`;
-      return offsetValue;
-    }
-  }
-
-  private static doRandomDate(maxAndMinDates: string): number {
-    // Expect exactly two comma-separated epoch numbers: "fromEpoch,toEpoch".
-    const maxAndMin: string[] = maxAndMinDates.split(",");
-
-    if (maxAndMin.length != 2 || Number.isNaN(+maxAndMin[0]) || Number.isNaN(+maxAndMin[1]))
-      throw new Error(`Invalid Maximum and Minimum dates. Expect {random;date(fromEpoch,toEpoch);<format>}. Max/min was: [${maxAndMinDates}]`);
-    const minDate = Number(maxAndMin[0]);
-    const maxDate = Number(maxAndMin[1]);
-    if (minDate > maxDate) throw new Error(`Minimum date greater than maximum!! Max/min was: [${maxAndMinDates}]`);
-    // Pick a random whole number of days within the inclusive range and add that many days
-    // (in milliseconds) onto minDate.
-    return minDate + Math.abs(Utils.getRandomInt(0, this.numberOfDays(minDate, maxDate) - 1)) * 1000 * 60 * 60 * 24;
-  }
-
-  /**
-   * Throws a clear, actionable error if `zone` is not a real, recognised IANA timezone name.
-   * Shared validation for the `timezone`/`diff` tokens and the `date` token's optional 3rd
-   * (zone) part — every one of them accepts a raw IANA zone string, whether typed directly or
-   * produced by nesting `[[timezone|...]]]`, so they all validate it identically.
-   *
-   * Deliberately validated by attempting to construct an `Intl.DateTimeFormat` with the given
-   * zone, rather than checking membership in `Intl.supportedValuesOf("timeZone")` — the latter
-   * only lists ICU's *canonical* zone names, which excludes plenty of names testers would
-   * reasonably expect to work (e.g. "UTC" itself, or "Asia/Kathmandu" — ICU's canonical name
-   * for the same zone is "Asia/Katmandu"). `Intl.DateTimeFormat` resolves the full alias table
-   * the runtime actually understands, matching what every other `Intl`/date-fns-tz call in
-   * this file will do with the same string anyway.
-   * @param zone - Candidate IANA zone name, e.g. "Europe/London"
-   * @param context - Short description of which token/argument is being validated, prefixed
-   *   onto the error message so a tester can tell exactly where the bad zone name was typed.
-   * @throws If `zone` is not a timezone name/alias the runtime recognises
-   */
-  private static assertValidIANAZone(zone: string, context: string): void {
-    try {
-      // Constructing this throws synchronously on an unrecognised zone — the formatter
-      // instance itself is discarded, this call's only job is the validation side effect.
-      new Intl.DateTimeFormat(undefined, { timeZone: zone });
-    } catch {
-      throw new Error(`${context}: [${zone}] is not a recognised IANA timezone name (e.g. "Europe/London", "Africa/Lusaka", "UTC").`);
-    }
-  }
-
-  private static doTimezoneToken(tokenBody: string): string {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves a `[[timezone|<IANAZoneName>]]` token: just validates the given zone name and
-    // returns it unchanged — the "standard form" other tokens (date's zone part, diff) expect
-    // is simply the validated IANA zone string itself, so this doubles as both a validator and
-    // a pass-through, nestable directly inside those other tokens' own argument lists.
-
-    const zone = tokenBody.trim();
-    this.assertValidIANAZone(zone, "Timezone token");
-    return zone;
-  }
-
-  private static doDiffToken(tokenBody: string): string {
-
-    ////////////////////////////////////////////////////
-    //
-    // Resolves a `[[diff|<zoneA>|<zoneB>]]` token: validates both zone names, looks up each
-    // one's current UTC offset (DST-aware, since it's resolved "now" rather than from a fixed
-    // per-zone constant), and returns zoneA's offset minus zoneB's, in hours, as a plain
-    // decimal number string. "UTC" is itself a valid zone, so a single zone's offset from UTC
-    // is just this same token with "UTC" as the other side.
-
-    const [zoneA, zoneB] = StringUtils.splitRemaining(tokenBody, this._delimiter, 2);
-    // Both zones are mandatory — there's no meaningful "diff" with only one side given.
-    if (!zoneA || !zoneB) throw new Error(`Diff token needs 2 IANA zone names (IE. {{diff;<zoneA>;<zoneB>}}). Got [${tokenBody}]`);
-    this.assertValidIANAZone(zoneA, "Diff token's first zone");
-    this.assertValidIANAZone(zoneB, "Diff token's second zone");
-
-    // Compute each zone's offset from UTC, in milliseconds, at the current moment.
-    const now = Date.now();
-    const offsetA = getTimezoneOffset(zoneA, now);
-    const offsetB = getTimezoneOffset(zoneB, now);
-    // zoneA's offset minus zoneB's, converted to hours — this gives "how many hours ahead of
-    // zoneB is zoneA", matching the argument order the tester typed.
-    const diffHours = (offsetA - offsetB) / (1000 * 60 * 60);
-    // Round to 2 decimal places (covers every real-world zone, including 15/45-minute-offset
-    // ones) and let Number→String drop any trailing zeros, so whole-hour diffs read as plain
-    // integers ("5", not "5.00") rather than always carrying two decimal places.
-    const roundedDiffHours = Math.round(diffHours * 100) / 100;
-    Log.writeLine(LogLevels.TestDebug, `Diff between [${zoneA}] and [${zoneB}] is [${roundedDiffHours}] hours`);
-    return String(roundedDiffHours);
-  }
-
-  private static numberOfDays(minDate: number, maxDate: number): number {
-    Log.writeLine(LogLevels.TestDebug, `Min date [${minDate}], Max date[${maxDate}]`);
-    const MS_PER_DAY = 1000 * 60 * 60 * 24;
-    // Inclusive day count between the two epochs (order-independent, via Math.abs) — +1 so
-    // the range includes both endpoints as valid days, not just the days strictly between.
-    const numberOfDays = Math.floor(Math.abs((minDate - maxDate) / MS_PER_DAY)) + 1;
-    Log.writeLine(LogLevels.TestDebug, `Min date [${minDate}], Max date[${maxDate}].  Number of days [${numberOfDays}]`);
-    return numberOfDays;
-  }
-
-  private static doRandomFloat(limits: string): number {
-    // Expect exactly two comma-separated numbers: "min,max".
-    const minimumAndMaximum: string[] = limits.split(",");
-
-    if (minimumAndMaximum.length != 2)
-      throw new Error(`Invalid Maximum and Minimum floats. Expect {{random.float(min;max),<format>}}. Max/min was: [${limits}]`);
-    const min = parseFloat(minimumAndMaximum[0]);
-    const max = parseFloat(minimumAndMaximum[1]);
-
-    // Validate min and max separately so the error pinpoints which one is actually invalid.
-    if (isNaN(min)) throw new Error(`Invalid Minimum float. Expect {{random.float(min;max),<format>}}. Max/min was: [${limits}]`);
-    if (isNaN(max)) throw new Error(`Invalid Maximum float. Expect {{random.float(min;max),<format>}}. Max/min was: [${limits}]`);
-
-    return Utils.getRandomFloat(min, max);
-  }
-}
-
-class InnermostToken {
-  private tokenPreamble: string;
-  private tokenPostamble: string;
-  private _childToken: string;
-  private foundToken: boolean;
-  private escapeChar: string;
-
-  constructor(inputString: string, StartTokenChar: string, EndTokenChar: string, EscapeChar: string) {
-
-    ////////////////////////////////////////////////////
-    //
-    // Locates exactly one token boundary pair within inputString — the innermost one if
-    // tokens are nested — by finding the FIRST (leftmost) non-escaped `]]`, then scanning
-    // backward from there for the nearest non-escaped `[[`. Searching for the end sequence
-    // first and the start sequence second (rather than the more obvious start-first) is what
-    // makes this naturally resolve the innermost token: an outer `[[` further to the left
-    // would only be found if there were no closer, more-nested `[[` between it and this `]]`.
-
-    let startIndex = -1;
-    let endIndex = -1;
-
-    this.escapeChar = EscapeChar;
-    // Find the first (leftmost) non-escaped end token sequence. Because we search left-to-right this naturally
-    // gives us the innermost token when tokens are nested.
-    for (let index = 0; index <= inputString.length - EndTokenChar.length; index++) {
-      if (inputString.startsWith(EndTokenChar, index) && !this.isEscaped(inputString, index)) {
-        endIndex = index;
-        break;
-      }
-    }
-
-    // Now scan right-to-left from just before the end sequence to find the matching non-escaped start sequence.
-    if (endIndex !== -1) {
-      for (let index = endIndex - 1; index >= 0; index--) {
-        if (inputString.startsWith(StartTokenChar, index) && !this.isEscaped(inputString, index)) {
-          startIndex = index;
-          break;
-        }
-      }
-    }
-
-    if (startIndex !== -1 && endIndex !== -1) {
-      // Found a complete, matched token — split the string into the three parts around it.
-      this.tokenPreamble = inputString.substring(0, startIndex);
-      this.tokenPostamble = inputString.substring(endIndex + EndTokenChar.length);
-      this._childToken = inputString.substring(startIndex, endIndex); // includes StartTokenChar, excludes EndTokenChar
-    } else {
-      // No complete token found at all (no `]]`, or a `]]` with no matching `[[` before it)
-      // — treat the whole input as preamble, with no token and no postamble.
-      this.tokenPreamble = inputString;
-      this.tokenPostamble = "";
-      this._childToken = "";
-    }
-    this.foundToken = startIndex !== -1 && endIndex !== -1;
-  }
-
-  public get preamble(): string {
-    return this.tokenPreamble;
-  }
-
-  public get postamble(): string {
-    return this.tokenPostamble;
-  }
-
-  public get childToken(): string {
-    return this._childToken;
-  }
-
-  public get hasToken(): boolean {
-    return this.foundToken;
-  }
-
-  private isEscaped(fullString: string, positionToTest: number): boolean {
-
-    ////////////////////////////////////////////////////
-    //
-    // Determines whether the boundary sequence starting at positionToTest is escaped, by
-    // counting the run of consecutive escape characters immediately before it: an odd count
-    // means the boundary itself is escaped (one escape char "consumed" by it, the rest
-    // pairing off), an even count means it's not (the run is just literal escaped-escape-char
-    // pairs with nothing left over to escape the boundary).
-
+  private static isEscaped(fullString: string, positionToTest: number): boolean {
     let index: number;
     let escapeCharCount = 0;
     let returnIsEscaped = false;
@@ -1291,7 +816,7 @@ class InnermostToken {
       // Walk backward counting consecutive escape chars, stopping at the first non-escape
       // char (or the start of the string).
       while (!(--index < 0)) {
-        if (fullString[index] == this.escapeChar) {
+        if (fullString[index] == this.EscapeChar) {
           escapeCharCount++;
         } else {
           break;
@@ -1309,16 +834,49 @@ class InnermostToken {
 // ─── Detokeniser types ────────────────────────────────────────────────────────
 
 /**
- * Signature for a custom token handler registered via {@link Detokeniser.addCallback}.
+ * Everything a verb handler needs, parsed once by the engine before any handler is called —
+ * see {@link Detokeniser}'s own "Token syntax"/"Qualifier parsing" doc sections for the rules
+ * that produce these fields.
+ */
+export interface Detokeniser_CallbackContext {
+  /** The matched verb, lowercased/trimmed — e.g. `"date"`. */
+  verb: string;
+  /**
+   * The verb section exactly as written, unparsed — e.g. `"date"` or `"date(nsw)"` or
+   * `"someverb(ddd(sd)"`. A safety net: use this if a handler needs to see the literal text
+   * rather than trust the engine's own `verb`/`qualifier` split.
+   */
+  rawVerb: string;
+  /** Content of `verb(...)`, if the token had a qualifier — `undefined` otherwise. */
+  qualifier: string | undefined;
+  /** Everything after the verb section, already de-escaped. Handler-specific shape. */
+  args: string;
+  /**
+   * The current {@link Detokeniser.delimiter} — e.g. `"|"` by default. A handler that splits
+   * `args` into further parts itself (most do) must split on this, not a hardcoded `"|"`, so
+   * it keeps working correctly if a caller has changed the delimiter (e.g. a Cucumber `Before`
+   * hook setting `Detokeniser.delimiter = ';'` to avoid colliding with a DataTable's own use
+   * of `|` as a column separator).
+   */
+  delimiter: string;
+  /** The same {@link Detokeniser.DoOptions} the caller passed to {@link Detokeniser.doAsync}. */
+  options: Detokeniser.DoOptions;
+}
+
+/**
+ * Signature for a handler registered via {@link Detokeniser.addCallback}. Every built-in verb
+ * handler is implemented with this same shape.
  *
  * May be synchronous or asynchronous — {@link Detokeniser.doAsync}, the only entry point,
  * always awaits the result either way.
  *
- * @param token - Full token body without `[[` / `]]` endstops, e.g. `"mytype|arg1|arg2"` (delimiter is always `|`)
- * @returns The replacement string, a Promise resolving to it, or `undefined` to pass to the next handler
+ * @param context - See {@link Detokeniser.CallbackContext}. Destructure only the fields a
+ *   given handler needs — e.g. `({ args }) => ...` for the common case.
+ * @returns The replacement string, a Promise resolving to it, or `undefined` to pass to the
+ *   next handler registered for this verb.
  */
 export interface Detokeniser_Callback {
-  (token: string): string | undefined | Promise<string | undefined>;
+  (context: Detokeniser.CallbackContext): string | undefined | Promise<string | undefined>;
 }
 
 /**
@@ -1351,5 +909,6 @@ export interface Detokeniser_DoOptions {
 // eslint-disable-next-line @typescript-eslint/no-namespace
 export namespace Detokeniser {
   export type Callback = Detokeniser_Callback;
+  export type CallbackContext = Detokeniser_CallbackContext;
   export type DoOptions = Detokeniser_DoOptions;
 }

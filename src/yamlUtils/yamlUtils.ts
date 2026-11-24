@@ -7,7 +7,7 @@ import { Log, Utils } from "../index.js";
  *
  * Deliberately minimal for now: just the `JSON.parse`/`JSON.stringify` equivalent pair,
  * nothing from the underlying `yaml` package's own `Document`/comment-preserving mutation
- * API (`parseDocument`, `visit`, etc.). Nothing calls into that yet — DataTable-based
+ * API (`parseDocument`, `visit`, etc.). Nothing calls into that yet — table-driven
  * path modifications against a YAML base aren't wired up anywhere in the ecosystem yet
  * (`cucumber`'s own file-sourced YAML body step is still an unimplemented stub); when
  * that gets built, *that* is the point to reach for `Document` instead of extending this,
@@ -25,9 +25,9 @@ export class YamlUtils {
    * "parse as much of it as it can" leniency mode. Same rule every other cast in this
    * ecosystem follows (`number:`/`boolean:`/`json:`/etc. — see `ValueExpression.parse`'s
    * own doc comment) — a test deliberately sending broken YAML wants that caught loudly,
-   * not quietly salvaged;
-   * confirmed directly against the library itself that this is also already its default,
-   * this just pins it so a version bump can't change that from under us.
+   * not quietly salvaged. Confirmed directly against the library itself that strict mode is
+   * already its default — this just pins that choice explicitly, so a future version bump
+   * can't silently change it from under us.
    *
    * @param yaml - The YAML string to parse.
    * @returns The parsed value — a string, number, boolean, `null`, plain object, or array.

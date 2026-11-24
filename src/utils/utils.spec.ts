@@ -1,4 +1,6 @@
 import path from "path";
+import { generateKeyPairSync } from "node:crypto";
+import { verify as jwtVerify } from "jsonwebtoken";
 
 import { Logger } from "../logger/logger.js";
 import { Utils } from "./utils.js";
@@ -169,5 +171,60 @@ describe("Utils.timeoutPromise", () => {
       await assertion;
       expect(vi.getTimerCount()).toBe(0);
     });
+  });
+});
+
+// =============================================================================
+// Utils.base64
+// =============================================================================
+
+describe("Utils.base64", () => {
+
+  it("encodes", () => {
+    expect(Utils.base64("Hello World", "encode")).toBe(Buffer.from("Hello World").toString("base64"));
+  });
+
+  it("decodes", () => {
+    const encoded = Buffer.from("Hello World").toString("base64");
+    expect(Utils.base64(encoded, "decode")).toBe("Hello World");
+  });
+
+  it("round-trips", () => {
+    const value = "roundtrip test 123";
+    expect(Utils.base64(Utils.base64(value, "encode"), "decode")).toBe(value);
+  });
+
+  it("rejects a direction other than encode/decode", () => {
+    expect(() => Utils.base64("x", "bad" as "encode")).toThrow(/must be 'encode' or 'decode'/);
+  });
+});
+
+// =============================================================================
+// Utils.createJWT
+// =============================================================================
+
+describe("Utils.createJWT — signature newline normalisation", () => {
+
+  it("signs with an RS256 PEM private key whose real newlines were flattened to literal '\\n' (the standard single-line-env-var form) — regression: the search string used to be double-escaped '\\\\n', which never matched this, so jwtSign was previously handed the still-flattened PEM text and rejected it as an invalid key", () => {
+    // A genuine RSA key pair, generated fresh for this test — not a fixture — so this test
+    // never depends on any other spec file's own test key.
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const realPemText = privateKey.export({ type: "pkcs1", format: "pem" }) as string;
+    // Flatten the key's real newlines down to the literal two-character "\n" sequence — the
+    // exact shape a multi-line PEM key takes once stored as a single-line env var, which is
+    // what createJWT's own doc comment on normalizedSignature says this is for.
+    const flattenedPemText = realPemText.replace(/\n/g, "\\n");
+    expect(flattenedPemText.includes("\n")).toBe(false); // sanity-check the flattening above
+
+    // If normalisation is broken (restored to the old double-escaped '\\\\n' search), jwtSign
+    // receives the still-flattened, single-line text and throws "not valid key" from inside
+    // createJWT's own try/catch — which Log.logErrorAndThrow turns into a thrown Error here.
+    const token = Utils.createJWT({ sub: "test-user" }, flattenedPemText, { algorithm: "RS256" });
+
+    // The real proof the newlines were actually restored: verifying the token against the
+    // matching public key only succeeds if jwtSign signed with the real private key, which
+    // only parses correctly once its newlines are real again.
+    const decoded = jwtVerify(token, publicKey.export({ type: "pkcs1", format: "pem" }), { algorithms: ["RS256"] });
+    expect(decoded).toMatchObject({ sub: "test-user" });
   });
 });

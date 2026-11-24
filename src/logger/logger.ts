@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import { format } from "date-fns";
 import {
   VideoOptions,
+  ResolvedVideoOptions,
   WriteLineOptions,
   Options,
   LogOutputCallbackSignature
@@ -151,8 +152,7 @@ export class Logger {
    *   myReporter.attach(message, mediaType ?? "text/plain");
    * };
    */
-  public static logOutputCallback: LogOutputCallbackSignature | undefined =
-    undefined;
+  public static logOutputCallback: LogOutputCallbackSignature | undefined = undefined;
 
   /**
    * Resets the logger to its default configuration.
@@ -543,14 +543,7 @@ export class Logger {
    * Logger.videoOptions = { videoCodec: "mp4", width: 1280, height: 720 };
    */
   public static set videoOptions(options: VideoOptions) {
-    // Merge the given options over the current ones: codec falls back to whatever's
-    // already configured if not given, and width/height are resolved (and validated) by
-    // checkAndGetVideoResolution, which itself falls back to the current values on any
-    // invalid dimension.
-    this.options.video = {
-      videoCodec: options.videoCodec ?? this.options.video.videoCodec,
-      ...this.checkAndGetVideoResolution(options)
-    };
+    this.options.video = this.resolveVideoOptions(options);
   }
 
   /**
@@ -726,16 +719,9 @@ export class Logger {
       const errorText = `Cannot Logger.attachVideo as [video] must be a Buffer. Is [${typeof video}]`;
       Logger.logErrorAndThrow(errorText);
     }
-    // No options given — use the current defaults outright. Options given — merge codec
-    // (falling back to current default) and validate/resolve width/height the same way the
-    // videoOptions setter does.
-    const actualOptions =
-      options == null
-        ? this.options.video
-        : {
-          videoCodec: options.videoCodec ?? this.options.video.videoCodec,
-          ...this.checkAndGetVideoResolution(options)
-        };
+    // Resolve the effective options the same way the videoOptions setter does — see
+    // resolveVideoOptions's own comment for the merge/validation rules.
+    const actualOptions = this.resolveVideoOptions(options);
 
     // Base64-encode the raw video bytes into a data: URI using the resolved codec.
     const videoSourceString =
@@ -904,7 +890,7 @@ export class Logger {
       // maxLines must be at least 3 (one line, one truncation notice, one last line) for the
       // truncation logic below to make sense at all — reject anything lower immediately.
       if (normalizedMaxLines < 3) {
-        const errorMessage = `maxLines must be 3 or greater!  Number given was <${maxLines}>`
+        const errorMessage = `maxLines must be 3 or greater!  Number given was <${maxLines}>`;
         Logger.logErrorAndThrow(errorMessage);
       }
 
@@ -975,10 +961,8 @@ export class Logger {
    * //   throw new Error(errText);
    */
   public static logErrorAndThrow(message: string, options?: WriteLineOptions): never {
-    // Log the message at Error level first — see this method's own doc comment above for why
-    // no stackOffset bump is needed for this method's own frame specifically.
+    // Log message at Error level
     Logger.writeLine(this.Levels.Error, message, options);
-    // Then throw, so callers get the usual `never`-typed unreachable-after-this-call behaviour.
     throw new Error(message);
   }
 
@@ -1094,6 +1078,23 @@ export class Logger {
     }
   }
 
+  /**
+   * Merges `options` (if given) over the currently configured video options — the one shared
+   * implementation behind both the {@link videoOptions} setter and {@link attachVideo}'s own
+   * per-call override, so the merge/validation rule only has to be written (and read) once.
+   * `undefined` returns the current options entirely unchanged; otherwise the codec falls
+   * back to whatever's already configured if not given, and width/height are resolved (and
+   * validated) by {@link checkAndGetVideoResolution}, which itself falls back to the current
+   * values on any invalid dimension.
+   */
+  private static resolveVideoOptions(options?: VideoOptions): ResolvedVideoOptions {
+    if (options == null) return this.options.video;
+    return {
+      videoCodec: options.videoCodec ?? this.options.video.videoCodec,
+      ...this.checkAndGetVideoResolution(options)
+    };
+  }
+
   private static checkAndGetVideoResolution(resolution: {
     height?: number;
     width?: number;
@@ -1126,24 +1127,13 @@ export class Logger {
         `Invalid video window width [${resolution.width}]: must be number equal or between ${this.videoResolutionLimits.minWidth} and ${this.videoResolutionLimits.maxWidth}. Width (and height if set) ignored`
       );
 
-    // height resolves to: current value if omitted; the new value if given AND both
-    // dimensions passed validation; otherwise the current value (validation failure on
-    // either side falls both dimensions back, not just the invalid one).
-    const height = (
-      resolution.height == null
-        ? this.options.video.height
-        : heightValid && widthValid
-          ? resolution.height
-          : this.options.video.height
-    ) as number;
-    // Same resolution logic, independently, for width.
-    const width = (
-      resolution.width == null
-        ? this.options.video.width
-        : heightValid && widthValid
-          ? resolution.width
-          : this.options.video.width
-    ) as number;
+    // height resolves to the new value only if it was actually given AND both dimensions
+    // passed validation; the current value is kept otherwise — whether height was simply
+    // omitted, or a validation failure on EITHER side fell both dimensions back, not just
+    // the invalid one.
+    const height = resolution.height != null && heightValid && widthValid ? resolution.height : this.options.video.height;
+    // Same resolution rule, independently, for width.
+    const width = resolution.width != null && heightValid && widthValid ? resolution.width : this.options.video.width;
     return { height, width };
   }
 

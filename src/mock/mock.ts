@@ -1,7 +1,7 @@
 import { STATUS_CODES } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { Utils } from '../utils/utils.js';
-import { JsonUtils, Log, Logger, LogLevels } from '../index.js';
+import { JsonUtils, Log, LogLevels } from '../index.js';
 
 /**
  * Static HTTP request interception and mocking utility for test suites.
@@ -204,22 +204,38 @@ export class Mock {
       if (action === null || typeof action !== 'object' || Array.isArray(action)) {
         Mock.throwError('addListener', `[action] must be 'block', 'passthrough', or a Mock.Response object, got [${action === null ? 'null' : typeof action}]`);
       }
-      const response = action as Mock.Response;
-      // status must be a valid HTTP status code.
-      if (typeof response.status !== 'number' || !Number.isInteger(response.status) || response.status < 100 || response.status > 599) {
-        Mock.throwError('addListener', `[action.status] must be a valid HTTP status code (100-599), got [${response.status}]`);
+      const suppliedResponse = action as Mock.Response;
+      // status must be a valid HTTP status code. Describe (rather than directly embed) the
+      // offending value in the error: a caller passing something wildly wrong-typed here (e.g.
+      // a huge string where a number was expected) must not get that entire value dumped into
+      // the thrown/logged error text.
+      if (typeof suppliedResponse.status !== 'number' || !Number.isInteger(suppliedResponse.status) || suppliedResponse.status < 100 || suppliedResponse.status > 599) {
+        Mock.throwError('addListener', `[action.status] must be a valid HTTP status code (100-599), got [${Utils.describeValue(suppliedResponse.status)}]`);
       }
       // headers, if given at all, must be a plain object (not null, not an array).
-      if (response.headers !== undefined && (typeof response.headers !== 'object' || response.headers === null || Array.isArray(response.headers))) {
+      if (suppliedResponse.headers !== undefined && (typeof suppliedResponse.headers !== 'object' || suppliedResponse.headers === null || Array.isArray(suppliedResponse.headers))) {
         Mock.throwError('addListener', `[action.headers] must be a plain object if provided`);
       }
-      // statusText wasn't supplied by the caller — default it from Node's own HTTP status-code
-      // table. '_undefined' is a deliberate escape hatch letting a caller force statusText to
-      // actually be undefined (rather than defaulted), since plain `undefined` can't be
-      // distinguished from "not supplied" once it's sitting on the object.
-      if (Utils.isUndefined(action.statusText))
-        action.statusText = STATUS_CODES[action.status] ?? undefined;
-      else if (action.statusText === '_undefined') action.statusText = undefined;
+      // statusText, if given at all, must be a string — '_undefined' (handled below) is itself
+      // a string, not a type of its own, so this check still applies to it.
+      if (suppliedResponse.statusText !== undefined && typeof suppliedResponse.statusText !== 'string') {
+        Mock.throwError('addListener', `[action.statusText] must be a string if provided, got [${Utils.describeValue(suppliedResponse.statusText)}]`);
+      }
+      // Work out the statusText Mock will actually store: the caller's own string if they gave
+      // one, Node's own HTTP status-code table default if they didn't supply one at all, or
+      // `undefined` if they used the '_undefined' sentinel to force that explicitly — plain
+      // `undefined` can't itself be distinguished from "not supplied" once it's sitting on the
+      // object, which is why that sentinel exists.
+      const resolvedStatusText = Utils.isUndefined(suppliedResponse.statusText)
+        ? STATUS_CODES[suppliedResponse.status] ?? undefined
+        : suppliedResponse.statusText === '_undefined' ? undefined : suppliedResponse.statusText;
+      // Replace `action` with Mock's own fresh copy of the response, rather than mutating the
+      // caller's original object in place and storing a live reference to it. The caller may
+      // reuse that same object across several addListener calls, or hold onto it after this
+      // call returns — mutating it here (the previous behaviour) silently changed the caller's
+      // own object out from under them, and storing it by reference meant any later mutation by
+      // the caller would retroactively change what this listener returns too. Both were bugs.
+      action = { ...suppliedResponse, statusText: resolvedStatusText };
     }
 
     // delayMs must be a non-negative finite number.
@@ -454,13 +470,19 @@ export class Mock {
     if (response === null || response === undefined || typeof response !== 'object' || Array.isArray(response)) {
       Mock.throwError('completePassthrough', `[response] must be a non-null object, got [${response === null ? 'null' : typeof response}]`);
     }
-    // response.status must be a valid HTTP status code.
+    // response.status must be a valid HTTP status code. Describe (rather than directly embed)
+    // the offending value, for the same reason as addListener's equivalent check above: a
+    // wrong-typed value here could be arbitrarily large caller content.
     if (typeof response.status !== 'number' || !Number.isInteger(response.status) || response.status < 100 || response.status > 599) {
-      Mock.throwError('completePassthrough', `[response.status] must be a valid HTTP status code (100-599), got [${response.status}]`);
+      Mock.throwError('completePassthrough', `[response.status] must be a valid HTTP status code (100-599), got [${Utils.describeValue(response.status)}]`);
     }
     // response.headers, if given at all, must be a plain object.
     if (response.headers !== undefined && (typeof response.headers !== 'object' || response.headers === null || Array.isArray(response.headers))) {
       Mock.throwError('completePassthrough', `[response.headers] must be a plain object if provided`);
+    }
+    // response.statusText, if given at all, must be a string.
+    if (response.statusText !== undefined && typeof response.statusText !== 'string') {
+      Mock.throwError('completePassthrough', `[response.statusText] must be a string if provided, got [${Utils.describeValue(response.statusText)}]`);
     }
 
     // Look up the pending transaction's original request/listener details (stashed when the
@@ -570,21 +592,20 @@ export class Mock {
     // listener — is treated as a non-match for that matcher/listener rather than aborting the
     // whole search, so one bad listener can't stop every other listener from being considered.
 
-    Logger.writeLine(LogLevels.FrameworkInformation, `Checking if any listeners for [${request.url} (${request.method})]`);
+    // (`Log` and `Logger` are the same class under two export names — this file uses `Log`
+    // consistently throughout, including here.)
+    Log.writeLine(LogLevels.FrameworkInformation, `Checking if any listeners for [${request.url} (${request.method})]`);
     for (const listener of Mock.listeners.values()) {
       try {
         // A listener matches only if every one of its matchers matches (AND, not OR).
         const allMatch = listener.matchers.every((matcher) => {
           try {
-            // Log the request being tested, for diagnostic visibility.
-            const x = JSON.stringify(request, null, 2);
-            Logger.writeLine(LogLevels.TestInformation, x);
             // Wrap the request in a single-element array since JsonUtils' JSONPath matching
             // expects an array-shaped root to query against; a non-zero match count means
             // this matcher matched.
             const matched = JsonUtils.getMatchingJSONPropertyCount([request] as unknown as object, matcher) > 0;
             if (matched) {
-              Logger.writeLine(LogLevels.FrameworkDebug, `Matched on [${matcher}]`);
+              Log.writeLine(LogLevels.FrameworkDebug, `Matched on [${matcher}]`);
               return true;
             }
             return false;
@@ -599,7 +620,7 @@ export class Mock {
         // All matchers matched — this listener wins; stop searching and return it.
         if (allMatch) return listener;
         else {
-          Logger.writeLine(LogLevels.FrameworkDebug, 'No matches');
+          Log.writeLine(LogLevels.FrameworkDebug, 'No matches');
         }
       } catch (e) {
         // Something unexpected went wrong evaluating this listener as a whole — log it and

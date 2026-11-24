@@ -13,7 +13,7 @@ export class JsonUtils {
    * Sentinel value recognised by {@link updateJSONObject} and {@link resolveSentinels}:
    * when a property's value is exactly this string, the property is removed entirely
    * rather than set to the literal text. The only way to express "delete this key" from
-   * a plain data value (a DataTable cell, a JSON literal, a file's contents) — there is
+   * a plain data value (a table/config cell, a JSON literal, a file's contents) — there is
    * no other textual convention for "omit this key" as distinct from "never mention this
    * key at all".
    */
@@ -22,8 +22,8 @@ export class JsonUtils {
   /**
    * Sentinel value recognised by {@link resolveSentinels}: when a property's value is
    * exactly this string, the property is set to a real `null` rather than the literal
-   * text `"_null"`. Exists because a DataTable cell is always a string — there is no way
-   * to type an actual `null` into one — whereas a JSON literal or file can already express
+   * text `"_null"`. Exists because a plain table/config cell is always a string — there is
+   * no way to type an actual `null` into one — whereas a JSON literal or file can already express
    * real `null` directly and has no need of this sentinel.
    */
   public static readonly SENTINEL_NULL = "_null";
@@ -110,8 +110,29 @@ export class JsonUtils {
       // one): the parent's path with the new name appended, using bracket notation as-is if
       // the caller already supplied it (e.g. "['odd key']"), otherwise joined with a dot.
       const objectBeingRenamedParent = this.getPropertiesMatchingPath(jsonObject, parentPath);
-      let pathToNewObject = StringUtils.replaceAll(objectBeingRenamedParent[0].pointer, "/", ".") as string;
-      pathToNewObject = StringUtils.isBlank(pathToNewObject) ? normalizedNewName : ((normalizedNewName.startsWith("['") && normalizedNewName.endsWith("']")) ? pathToNewObject.substring(1) + normalizedNewName : pathToNewObject.substring(1) + "." + normalizedNewName);
+      // Turn the parent's own JSON Pointer ("/a/b") into dot notation (".a.b") as a
+      // starting point for the new property's path.
+      const parentPathAsDots = StringUtils.replaceAll(objectBeingRenamedParent[0].pointer, "/", ".") as string;
+      let pathToNewObject: string;
+      if (StringUtils.isBlank(parentPathAsDots)) {
+        // Parent is the root object itself (its pointer is "", which becomes "" in dot form
+        // too) — so the new property's path is just its own name, with nothing to prefix.
+        pathToNewObject = normalizedNewName;
+      } else {
+        // Parent is nested — drop parentPathAsDots' leading "." (it will be re-added, or
+        // isn't needed at all, depending on how the new name is joined on below) and append
+        // the new name as a sibling of the old one.
+        const parentPathWithoutLeadingDot = parentPathAsDots.substring(1);
+        const newNameIsBracketNotation = normalizedNewName.startsWith("['") && normalizedNewName.endsWith("']");
+        if (newNameIsBracketNotation) {
+          // Caller already supplied bracket notation (e.g. "['odd key']") — append it
+          // directly, with no separating "." (the brackets are the separator).
+          pathToNewObject = parentPathWithoutLeadingDot + normalizedNewName;
+        } else {
+          // Plain property name — join it to the parent path with a ".".
+          pathToNewObject = parentPathWithoutLeadingDot + "." + normalizedNewName;
+        }
+      }
       // Deep-copy the source object — everything from here on operates on the copy only.
       let updatedObject = JSON.parse(JSON.stringify(jsonObject));
       // We rename the property by adding the property using the new name...
@@ -285,39 +306,37 @@ export class JsonUtils {
 
     ////////////////////////////////////////////////////
     //
-    // Normalises item to a string (stringifying it first if it's already an object), then
-    // parses that string and checks the parsed result is itself an object (not a primitive)
-    // — a round-trip check, since the only way to be sure a string really "is JSON" (as
-    // opposed to merely a quoted primitive like '"true"' or '42') is to actually parse it.
+    // Normalises item into its string form (stringifying it first if it's already an
+    // object), then parses that string and checks the parsed result is itself an object
+    // (not a primitive) — a round-trip check, since the only way to be sure a string really
+    // "is JSON" (as opposed to merely a quoted primitive like '"true"' or '42') is to
+    // actually parse it. Uses separate, clearly-named local variables for the "text" and
+    // "parsed result" stages rather than reassigning/retyping the `item` parameter itself,
+    // so a reader never has to track which of three different types `item` currently holds.
 
     // undefined is never valid JSON — short-circuit before the try/catch below.
     if (Utils.isUndefined(item)) {
       return false;
     }
+    // If item's already an object, stringify it first — everything from here on only deals
+    // with the text form, regardless of which form the caller originally passed in.
+    const itemAsText: string = typeof item === "object" ? JSON.stringify(item) : (item as string);
     try {
-      // If item's already an object, stringify it first — the rest of this function only
-      // deals with the string form either way.
-      item = typeof item === "object" ? JSON.stringify(item) : item;
       // Parse using JSON5 or strict JSON rules, per allowJson5. Throws on malformed input,
       // caught below.
-      item = allowJson5 ? json5.parse(item as string) : JSON.parse(item as string);
+      const parsedItem: unknown = allowJson5 ? json5.parse(itemAsText) : JSON.parse(itemAsText);
       // Only a parsed object (not a primitive like a number, string, or boolean) counts as
       // "is JSON" here — a bare '42' or '"hello"' parses fine but isn't what this is asking.
-      if (typeof item === "object" && item !== null) {
-        return true;
-      }
+      return typeof parsedItem === "object" && parsedItem !== null;
     } catch {
       // Parsing failed — not valid JSON (or JSON5, if that was requested).
       return false;
     }
-    // Parsed successfully but to a primitive, not an object — still not "is JSON" here.
-    return false;
   }
 
   /**
    * Asserts `value` is a plain object — not `null`, not an array, not a primitive — and
    * returns it narrowed to `Record<string, unknown>`. Shared validation for every caller
-   * that resolves some value (parsed JSON, a `ValueExpression`/`Detokeniser` result, a
    * test-data file's contents, etc.) and needs to guarantee it's actually an object before
    * treating it as one — e.g. a set of HTTP headers or body-path modifications can never
    * meaningfully be an array or a bare string/number.
@@ -430,14 +449,16 @@ export class JsonUtils {
       // Log the full object being queried (at a very low, framework-only verbosity) and the
       // match count (at normal test-debug verbosity) before returning.
       Log.writeLine(LogLevels.FrameworkDebug, `JSON:\n${JSON.stringify(jsonObject, null, 2)}`, { maxLines: 512 });
-      Log.writeLine(LogLevels.TestDebug, `For path [${pathToJSONProperties}], got ${jsonPropertys.length} matches`);
+      Log.writeLine(LogLevels.FrameworkInformation, `For path [${pathToJSONProperties}], got ${jsonPropertys.length} matches`);
 
       return jsonPropertys;
     } catch (err) {
-      // Something went wrong (invalid object, malformed JSONPath, etc.) — log it and
-      // re-throw with path-specific context rather than a bare library error.
-      Log.writeLine(LogLevels.Error, `Error getting Json properties with path [${pathToJSONProperties}] from object:\n${err}`);
-      throw new Error(`Error getting Json properties with path [${pathToJSONProperties}] from object:\n${err}`);
+      // Something went wrong (invalid object, malformed JSONPath, etc.) — build the error
+      // text once, log it, then throw the same text, rather than building it twice (and
+      // rather than dumping the raw caught value, which may not even be an Error).
+      const errText = `Error getting Json properties with path [${pathToJSONProperties}] from object:\n${Utils.errorMessage(err)}`;
+      Log.writeLine(LogLevels.Error, errText);
+      throw new Error(errText);
     }
   }
 
@@ -510,7 +531,7 @@ export class JsonUtils {
           Log.writeLine(LogLevels.TestDebug, `[${pathString}] already absent — nothing to delete`);
           return modifiedObject;
         }
-        Log.writeLine(LogLevels.TestDebug, "no matching properties found - will ADD property");
+        Log.writeLine(LogLevels.TestDebug, `no matching properties found - will ADD property [${pathString}]`);
         // No matches.  So work out what the Json pointer is and add it.  We prepend a period to denote path from the
         // top unless it's already rooted — a leading '$' (the JSONPath root token) or '[' (bracket notation) already
         // says "from the top" on its own; prepending another '.' in front of '$' makes jsonpath-plus treat the '$'
@@ -520,32 +541,54 @@ export class JsonUtils {
         const jsonPathArray = JSONPath.JSONPath.toPathArray(isAlreadyRooted ? pathString : '.' + pathString);
         jsonPointer = JSONPath.JSONPath.toPointer(jsonPathArray);
       } else {
-        // Yippee exactly one property — reuse its own already-resolved pointer directly.
+        // Exactly one property matched — reuse its own already-resolved pointer directly.
         Log.writeLine(LogLevels.TestDebug, "One matching property found - will update/delete property");
         jsonPointer = matchingProperties[0].pointer;
       }
       if (value === this.SENTINEL_UNDEFINED) {
         // Caller wants to delete the property identified by jsonPointer. Work out the final
-        // path segment (the property/index name itself) from the pointer.
-        const deadProperty = jsonPointer.split("/").pop() as string;
+        // path segment (the property/index name itself) from the pointer. JSON Pointer (RFC
+        // 6901) escapes any literal '/' in a segment as '~1' and any literal '~' as '~0' — so
+        // that escaped text has to be decoded back to the real key before use below. Without
+        // this, a property whose own name contains '/' or '~' (e.g. a header literally named
+        // "a/b") would silently fail to delete: `delete obj["a~1b"]` is a no-op against a real
+        // key of "a/b", and `delete` on a missing key never throws, so the failure would be
+        // completely silent. The imported `jsonpointer` package does this same decoding
+        // internally for its own get()/set(), but doesn't export it for reuse here, so it's
+        // re-implemented locally below, matching the package's own single-pass algorithm.
+        const deadPropertyEscaped = jsonPointer.split("/").pop() as string;
+        const deadProperty = deadPropertyEscaped.replace(/~[01]/g, (escapeSequence) => (escapeSequence === "~1" ? "/" : "~"));
         Log.writeLine(LogLevels.TestDebug, `value is _undefined so will delete property [${jsonPointer}]`);
         if (Array.isArray(matchingProperties[0].parent)) {
           // Parent is an array — removing a numeric index via `delete` would leave a hole
           // (an actual `undefined` slot) rather than shortening the array, so splice instead.
+          // Array indices are always plain decimal digits, so no un-escaping is needed here.
           Log.writeLine(LogLevels.TestDebug, `Deleting [${matchingProperties[0].parent}] is an array.  So remove by index....`);
           matchingProperties[0].parent.splice(Number(deadProperty), 1);
         } else {
           // Parent is a plain object — delete the property outright.
           Log.writeLine(LogLevels.TestDebug, `Deleting [${matchingProperties[0].parent}] is an NOT array.  So remove by deletion...`);
-          // Caller wants to delete property...
-          // http://perfectionkills.com/understanding-delete/
+          // TypeScript's `delete` operator requires the property's type to be optional, which
+          // a plain object's indexed access isn't by default — `any` is used purely to sidestep
+          // that compile-time restriction; it doesn't widen what's actually accessed at
+          // runtime, since deadProperty was already resolved from a real, already-matched
+          // property above. See http://perfectionkills.com/understanding-delete/ for background
+          // on why `delete` itself (as opposed to the cast) is the right tool here.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          delete (matchingProperties[0].parent as any)[deadProperty]; // How can I do this WITHOUT going via any?
+          delete (matchingProperties[0].parent as any)[deadProperty];
+          // Defensive check — verify the delete actually took effect, mirroring the read-back
+          // verification the "set" branch below does after JSONPointer.set. Without this, the
+          // escaping bug described above (or any future regression like it) would silently
+          // report success while leaving the property in place.
+          if (deadProperty in (matchingProperties[0].parent as object)) {
+            const errMessage = `After deleting property [${pathString}] (resolved key [${deadProperty}]), it is still present on its parent object.`;
+            Log.logErrorAndThrow(errMessage);
+          }
         }
       } else {
         // Caller wants to set (add or update) the property identified by jsonPointer to value.
         Log.writeLine(
-          LogLevels.TestDebug,
+          LogLevels.FrameworkInformation,
           `Updating or adding property [${jsonPointer}] with value: ${typeof value === "object" ? "\n" + JSON.stringify(value as object, null, 2) : value}`
         );
         JSONPointer.set(modifiedObject, jsonPointer, value);
@@ -560,7 +603,10 @@ export class JsonUtils {
       }
       return modifiedObject;
     } catch (err) {
-      const errText = `Error adding/updating/deleting property [${pathString}]: ${err}`;
+      // Build from Utils.errorMessage rather than the raw caught value — err may not be an
+      // Error at all (a caller/dependency could throw anything), and errorMessage handles
+      // that safely either way.
+      const errText = `Error adding/updating/deleting property [${pathString}]: ${Utils.errorMessage(err)}`;
       // Only write error out if we are Test Debug or lower.  No need for Test Information)
       if (Log.loggingLevel < LogLevels.TestInformation) {
         Log.writeLine(
@@ -586,7 +632,7 @@ export class JsonUtils {
    * needed no resolving) — only a subtree actually containing a sentinel gets rebuilt.
    *
    * Exists so any caller building a value from a source that can only express plain strings
-   * — a Cucumber DataTable cell, a JSON literal, a file's contents — gets a uniform way to
+   * — a table/config cell, a JSON literal, a file's contents — gets a uniform way to
    * express "remove this property" or "a real null, not the text" regardless of which of
    * those sources it came from, and regardless of how deep it's nested. Deliberately a
    * single, reusable pass here in `@controlium/utils` rather than something every caller
@@ -605,7 +651,7 @@ export class JsonUtils {
    * data) must never turn "resolve a few sentinels" into a stack overflow.
    *
    * @param value - The value to resolve sentinels within — a plain object, array, or
-   *   primitive. Typically the result of merging a JSON literal/file/DataTable-sourced
+   *   primitive. Typically the result of merging a JSON literal/file/table-cell-sourced
    *   object, called *after* any merge so a sentinel in the new data can act on the
    *   already-merged result (e.g. removing a property that only existed before the merge).
    * @returns The resolved value, same shape as the input, with every `"_undefined"`
@@ -886,8 +932,9 @@ export class JsonUtils {
       }
     } catch (err) {
       // Something went wrong during removal — log it, and only re-throw if the caller
-      // explicitly asked for errors to propagate (default is to swallow them).
-      const errText = `Error in removing the property from JSON ${err}`;
+      // explicitly asked for errors to propagate (default is to swallow them). Built from
+      // Utils.errorMessage rather than the raw caught value, since err may not be an Error.
+      const errText = `Error in removing the property from JSON ${Utils.errorMessage(err)}`;
       Log.writeLine(LogLevels.Error, errText);
       if (throwError) throw new Error(errText);
     }

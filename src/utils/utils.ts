@@ -8,7 +8,6 @@ const { sign: jwtSign, decode: jwtDecode } = createRequire(import.meta.url)('jso
 import treeKill from "tree-kill";
 import picomatch from "picomatch";
 
-// import { Detokeniser } from "./Detokeniser"; Claude, just masking this out for now...
 import { JsonUtils } from "../index.js";
 import { Log, LogLevel, LogLevels } from "../index.js";
 import { StringUtils } from "../index.js";
@@ -372,7 +371,7 @@ export class Utils {
         }
     }
 
-    /**2
+    /**
      * Safely checks if a value is `null`.
      *
      * @param obj - Value to check.
@@ -480,10 +479,17 @@ export class Utils {
         // Re-add the stripped days back in as extra hours, so durations over 24h still show a
         // correct (if non-standard, e.g. "26:00:00") hour count rather than wrapping to "02:00:00".
         const hours = wholeDays * 24 + date.getUTCHours();
+        // The fractional part is tenths of a second, taken from the UTC milliseconds component
+        // (always 0-999). This must be FLOORED, not rounded: date.getUTCMilliseconds() can be up
+        // to 999, and Math.round(999 / 100) is 10 — a two-digit value that both breaks the
+        // documented single-digit `.t` format and silently overstates the duration by up to
+        // 0.05s, because that extra tenth is never carried into the seconds field above it.
+        // Flooring keeps the result always in 0-9, matching the format, with no carry needed.
+        const tenthsOfASecond = Math.floor(date.getUTCMilliseconds() / 100);
         // Hours is padded to at least 2 digits, but allowed to grow wider for very long
         // durations (e.g. "100" stays "100", not truncated back to 2 digits); minutes/seconds
-        // are always exactly 2 digits; the fractional part is tenths of a second (ms / 100, rounded).
-        return `${this.pad(hours, ("" + hours).length > 2 ? ("" + hours).length : 2)}:${this.pad(date.getUTCMinutes(), 2)}:${this.pad(date.getUTCSeconds(), 2)}.${Math.round(date.getUTCMilliseconds() / 100)}`;
+        // are always exactly 2 digits.
+        return `${this.pad(hours, ("" + hours).length > 2 ? ("" + hours).length : 2)}:${this.pad(date.getUTCMinutes(), 2)}:${this.pad(date.getUTCSeconds(), 2)}.${tenthsOfASecond}`;
     }
 
     /**
@@ -499,12 +505,12 @@ export class Utils {
         // passed them reversed (max < min), swap them here rather than producing a nonsensical
         // (or infinite-loop-prone) range below. Also rounds each bound inward (ceil the lower
         // bound, floor the upper bound) so a fractional input can't widen the inclusive range.
-        const minMax = min < max ? Math.ceil(min) : Math.ceil(max);
-        const maxMin = min < max ? Math.floor(max) : Math.floor(min);
+        const actualLowerBound = min < max ? Math.ceil(min) : Math.ceil(max);
+        const actualUpperBound = min < max ? Math.floor(max) : Math.floor(min);
         // Standard inclusive-random-integer formula: scale Math.random()'s [0,1) output across
         // the (inclusive) range width + 1, floor it down to a whole number, then shift up by the
         // lower bound.
-        return Math.floor(Math.random() * (maxMin - minMax + 1)) + minMax;
+        return Math.floor(Math.random() * (actualUpperBound - actualLowerBound + 1)) + actualLowerBound;
     }
 
     /**
@@ -552,39 +558,7 @@ export class Utils {
                     case ExistingFileWriteActions.AddIndex: {
                         // Don't overwrite — instead find a free, incrementing index suffix and
                         // recurse with that new name until we land on one that doesn't exist yet.
-                        const splitFileName = fileName.split(".");
-                        fileName =
-                            splitFileName.length === 1
-                                // No extension at all (e.g. "hello") — just tack ".1" straight on.
-                                ? fileName + ".1"
-                                : ((splitFileName: string[]): string => {
-                                    // If file name has 2 parts (e.g. hello.json) then add the index (e.g. hello.1.json)
-                                    if (splitFileName.length === 2) {
-                                        if (/^\d+$/.test(splitFileName[1])) {
-                                            // The "extension" is actually already a numeric index (e.g.
-                                            // "hello.1") — bump it rather than inserting a new one.
-                                            return splitFileName[0] + "." + (parseInt(splitFileName[1]) + 1);
-                                        } else {
-                                            // A normal two-part name (base + real extension) — insert
-                                            // ".1" between them.
-                                            return splitFileName[0] + ".1." + splitFileName[1];
-                                        }
-                                    }
-                                    // If file name has an index (e.g. hello.7.json or some.other.5.json) increment it
-                                    if (/^\d+$/.test(splitFileName[splitFileName.length - 2])) {
-                                        // Second-to-last segment is already a numeric index — increment
-                                        // it in place, keeping the base name and real extension either side.
-                                        return (
-                                            splitFileName.slice(0, splitFileName.length - 2).join(".") +
-                                            "." +
-                                            (parseInt(splitFileName[splitFileName.length - 2]) + 1) +
-                                            "." +
-                                            splitFileName[splitFileName.length - 1]
-                                        );
-                                    }
-                                    // 3+ part name without a numeric index (e.g. hello.addd.json) — add index (e.g. hello.addd.1.json)
-                                    return splitFileName.slice(0, splitFileName.length - 1).join(".") + ".1." + splitFileName[splitFileName.length - 1];
-                                })(splitFileName);
+                        fileName = Utils.incrementIndexedFileName(fileName);
                         // Recurse with the newly-derived name — if THAT also already exists, this
                         // same AddIndex branch runs again and bumps the index further, until a
                         // genuinely free filename is found.
@@ -633,15 +607,12 @@ export class Utils {
                         writeFileSync(fullFilename, Utils.serialiseFileData(data));
                     }
                 } else {
-                    if (
-                        !(splitFileName.length === 2 && /^\d+$/.test(splitFileName[splitFileName.length - 1])) &&
-                        ifExistsAction === ExistingFileWriteActions.AddIndex &&
-                        !/^\d+$/.test(splitFileName[splitFileName.length - 2])
-                    ) {
-                        // AddIndex requested, and the name isn't already numbered (neither a
-                        // simple "base.N" pair nor a "base.N.ext" triple) — insert the initial
-                        // ".1" index now, before the existence check below, so every AddIndex
-                        // write (even the very first one) consistently carries an index.
+                    // AddIndex requested, and the name isn't already numbered (checked via the
+                    // same positional rule incrementIndexedFileName uses, so the two stay
+                    // consistent) — insert the initial ".1" index now, before the existence
+                    // check below, so every AddIndex write (even the very first one)
+                    // consistently carries an index.
+                    if (ifExistsAction === ExistingFileWriteActions.AddIndex && !Utils.hasNumericIndexSegment(splitFileName)) {
                         fileName = splitFileName.slice(0, splitFileName.length - 1).join(".") + ".1." + splitFileName[splitFileName.length - 1];
                     }
                     fullFilename = path.join(filePath, fileName);
@@ -659,14 +630,80 @@ export class Utils {
         } catch (err) {
             // Catch-all for anything above (mkdir failure, write failure, a thrown
             // logErrorAndThrow, ...) — log it, then re-throw so the caller still sees the failure.
-            Log.writeLine(LogLevels.Error, `Unable to write text to file: ${err}`);
+            Log.writeLine(LogLevels.Error, `Unable to write text to file: ${Utils.errorMessage(err)}`);
             throw err;
         }
     }
 
     /**
+     * Decides whether a dot-split filename already carries a numeric index segment, using one
+     * consistent positional rule shared by both call sites in {@link writeTextToFile}:
+     * - Exactly 2 segments (e.g. `["hello", "3"]` from `"hello.3"`) — the index would be the
+     *   *second* segment, so that's the one checked.
+     * - 3 or more segments (e.g. `["hello", "3", "json"]` from `"hello.3.json"`) — the index
+     *   would be the *second-to-last* segment (the real extension is always last), so that's
+     *   the one checked instead.
+     *
+     * Getting this positional choice right matters: checking the wrong segment for the 2-segment
+     * case (e.g. checking the *first* segment instead) would misclassify a filename like
+     * `"123.json"` — a numeric base name with a perfectly ordinary, non-numeric extension — as
+     * "already indexed", even though `"123"` is just this file's actual name, not an index.
+     *
+     * @param segments - `fileName.split(".")`. Must have at least 2 segments — a bare, dot-free
+     *   name (1 segment) never carries an index segment by this rule; callers handle that shape
+     *   separately, before reaching here.
+     * @returns `true` if the relevant segment is purely digits, otherwise `false`.
+     */
+    private static hasNumericIndexSegment(segments: string[]): boolean {
+        const indexSegment = segments.length === 2 ? segments[1] : segments[segments.length - 2];
+        return /^\d+$/.test(indexSegment);
+    }
+
+    /**
+     * Computes the next candidate filename for {@link ExistingFileWriteActions.AddIndex}, by
+     * either inserting a fresh `.1` index segment or incrementing an existing one. Called by
+     * {@link writeTextToFile}, which recurses with the result until it lands on a name that
+     * doesn't already exist on disk.
+     *
+     * @param fileName - The filename to compute the next indexed candidate for.
+     * @returns The next candidate filename, one step further along than `fileName`.
+     *
+     * @example
+     * Utils.incrementIndexedFileName("hello");       // => "hello.1"      (no dots at all)
+     * Utils.incrementIndexedFileName("hello.3");     // => "hello.4"      (already indexed)
+     * Utils.incrementIndexedFileName("hello.json");  // => "hello.1.json" (real extension, not yet indexed)
+     * Utils.incrementIndexedFileName("hello.3.json"); // => "hello.4.json" (already indexed)
+     * Utils.incrementIndexedFileName("hello.addd.json"); // => "hello.addd.1.json" (3+ segments, not yet indexed)
+     */
+    private static incrementIndexedFileName(fileName: string): string {
+        const segments = fileName.split(".");
+
+        // No dot at all (e.g. "hello") — nothing to increment yet, so just start the index at ".1".
+        if (segments.length === 1) {
+            return fileName + ".1";
+        }
+
+        // 2 or more segments — work out, once, whether the index-position segment identified by
+        // hasNumericIndexSegment is already a number (increment it) or not (insert a fresh one).
+        const alreadyIndexed = Utils.hasNumericIndexSegment(segments);
+        const extension = segments[segments.length - 1];
+
+        if (segments.length === 2) {
+            // e.g. "hello.3" (already indexed) -> "hello.4"; "hello.json" (not indexed) -> "hello.1.json".
+            return alreadyIndexed ? `${segments[0]}.${parseInt(segments[1]) + 1}` : `${segments[0]}.1.${extension}`;
+        }
+
+        // 3+ segments, e.g. "hello.3.json" (already indexed) -> "hello.4.json";
+        // "hello.addd.json" (not indexed) -> "hello.addd.1.json".
+        const base = segments.slice(0, segments.length - 2).join(".");
+        return alreadyIndexed
+            ? `${base}.${parseInt(segments[segments.length - 2]) + 1}.${extension}`
+            : `${segments.slice(0, segments.length - 1).join(".")}.1.${extension}`;
+    }
+
+    /**
      * Resolves a relative "test data" path against a single configured root, with no
-     * mock-vs-test distinction — any test suite's own `.feature` file (or anything else)
+     * mock-vs-test distinction — any test suite's own test file (or anything else)
      * that references a test data file by a relative path goes through here.
      *
      * The root resolves via {@link getSetting} — env var `CONTROLIUM_TEST_DATA_PATH`, then
@@ -717,9 +754,6 @@ export class Utils {
      * @param path - Path to the file.
      * @param options - Optional settings:
      *   - `encoding` — File encoding (default: `"utf-8"`).
-     * @returns Contents of the file as a string. To detokenise it, pass the result
-     *   through `Detokeniser.doAsync()` yourself — this stays a plain file read, no
-     *   dependency on `Detokeniser` (which itself depends on this module).
      * @throws {Error} If the file cannot be read.
      */
     static getFileContents(filePath: string, options?: { encoding?: BufferEncoding }): string {
@@ -734,7 +768,7 @@ export class Utils {
         } catch (err) {
             // Covers both a read failure bubbling up from getFileContentsBuffer and a failure
             // in .toString(encoding) itself (e.g. an invalid/unsupported encoding name).
-            const errText = `Utils.getFileContents - Reading file using ${encoding} threw error: [${err}]`;
+            const errText = `Utils.getFileContents - Reading file using ${encoding} threw error: [${Utils.errorMessage(err)}]`;
             Log.logErrorAndThrow(errText);
         }
     }
@@ -751,7 +785,7 @@ export class Utils {
             Log.writeLine(LogLevels.TestDebug, `Getting file contents from [${filePath}]`);
             return readFileSync(filePath);
         } catch (err) {
-            const errText = `Utils.getFileContentsBuffer - readFileSync for path [${filePath}] threw error: [${err}]`;
+            const errText = `Utils.getFileContentsBuffer - readFileSync for path [${filePath}] threw error: [${Utils.errorMessage(err)}]`;
             Log.logErrorAndThrow(errText);
         }
     }
@@ -804,18 +838,18 @@ export class Utils {
      * );
      * // => { value: "http://...", source: "World 'eaTest.apiUrl'" }
      */
-    public static getSetting<returnType>(
+    public static getSetting<TValue>(
         logLevel: LogLevel,
         settingName: string,
         sources: {
             processEnvName?: string | undefined;
             npmPackageConfigName?: string | undefined;
             profileParameterName?: string | undefined;
-            defaultValue?: returnType | undefined;
+            defaultValue?: TValue | undefined;
             notFoundIsExpected?: boolean;
         },
         contextParameters?: SettingsContext,
-    ): SettingResult<returnType> {
+    ): SettingResult<TValue> {
         // Validate all three inputs up front — a bad logLevel/settingName/sources shape would
         // otherwise surface as a confusing failure deep inside the resolution logic below.
         Utils.assertType(logLevel, "number", "Utils.getSetting", "logLevel");
@@ -830,8 +864,8 @@ export class Utils {
         if (!Utils.isUndefined(returnValue)) {
             // Found a value here — resolve immediately, without even looking at the lower-
             // priority sources below.
-            Log.writeLine(logLevel, debugString + `env var [${sources.processEnvName}]. Value: <${returnValue as returnType}>`);
-            return { value: returnValue as returnType, source: `Env var '${sources.processEnvName}'` };
+            Log.writeLine(logLevel, debugString + `env var [${sources.processEnvName}]. Value: <${returnValue as TValue}>`);
+            return { value: returnValue as TValue, source: `Env var '${sources.processEnvName}'` };
         }
 
         // Next priority — npm package config variable. npm exposes these to a running script
@@ -839,8 +873,8 @@ export class Utils {
         // prefixed env var read.
         returnValue = sources.npmPackageConfigName ? process.env["npm_package_config_" + sources.npmPackageConfigName] : undefined;
         if (!Utils.isUndefined(returnValue)) {
-            Log.writeLine(logLevel, debugString + `npm package config var [${sources.npmPackageConfigName}]. Value: <${returnValue as returnType}>`);
-            return { value: returnValue as returnType, source: `npm package config '${sources.npmPackageConfigName}'` };
+            Log.writeLine(logLevel, debugString + `npm package config var [${sources.npmPackageConfigName}]. Value: <${returnValue as TValue}>`);
+            return { value: returnValue as TValue, source: `npm package config '${sources.npmPackageConfigName}'` };
         }
 
         // Neither env var nor npm config resolved anything — fall through to the profile-
@@ -881,8 +915,8 @@ export class Utils {
                 return { value: undefined, source: "Not found" };
             } else {
                 // A defaultValue was supplied and nothing higher-priority overrode it — use it.
-                Log.writeLine(logLevel, debugString + `default value: <${returnValue as returnType}>`);
-                return { value: returnValue as returnType, source: "Default value" };
+                Log.writeLine(logLevel, debugString + `default value: <${returnValue as TValue}>`);
+                return { value: returnValue as TValue, source: "Default value" };
             }
         }
 
@@ -893,11 +927,11 @@ export class Utils {
             Log.logErrorAndThrow(`Settings: Caller defined Profile parameter [${sources.profileParameterName}] but contextParameters is null!`);
         }
         // Re-resolve the single matching property and read its value out.
-        returnValue = JsonUtils.getPropertiesMatchingPath(parameters, sources.profileParameterName as string)[0].value as returnType;
+        returnValue = JsonUtils.getPropertiesMatchingPath(parameters, sources.profileParameterName as string)[0].value as TValue;
         // Strip the JSONPath root ("$." or "$") for a human-readable path — "$.eaTest.apiUrl" -> "eaTest.apiUrl".
         const humanReadablePath = (sources.profileParameterName as string).replace(/^\$\.?/, "");
-        Log.writeLine(logLevel, debugString + `profile property [${sources.profileParameterName}] value: <${returnValue as returnType}>`);
-        return { value: returnValue as returnType, source: `${sourceLabel} '${humanReadablePath}'` };
+        Log.writeLine(logLevel, debugString + `profile property [${sources.profileParameterName}] value: <${returnValue as TValue}>`);
+        return { value: returnValue as TValue, source: `${sourceLabel} '${humanReadablePath}'` };
     }
 
     /**
@@ -1091,6 +1125,39 @@ export class Utils {
         return decodeHTML(preProcessed).replace(/\u00A0/g, " ");
     }
 
+    // ── Base64 ────────────────────────────────────────────────────────────────
+
+    /**
+     * Base64-encodes or decodes a string.
+     *
+     * @param original - The string to encode or decode
+     * @param direction - `"encode"` to base64-encode; `"decode"` to base64-decode
+     * @returns The encoded or decoded string
+     * @throws If the conversion fails (e.g. invalid base64 input for decode)
+     *
+     * @example
+     * Utils.base64('Hello World', 'encode');      // → 'SGVsbG8gV29ybGQ='
+     * Utils.base64('SGVsbG8gV29ybGQ=', 'decode'); // → 'Hello World'
+     */
+    static base64(original: string, direction: "encode" | "decode"): string {
+        // original must actually be a string — fail fast and clearly if not.
+        Utils.assertType(original, "string", "Utils.base64", "original");
+        // direction must be exactly one of the two recognised literals.
+        if (direction !== "encode" && direction !== "decode") {
+            const errText = `Cannot Utils.base64 as [direction] must be 'encode' or 'decode'. Is [${Utils.describeValue(direction)}]`;
+            Log.logErrorAndThrow(errText);
+        }
+        try {
+            // Encode: treat original as UTF-8 text, output base64. Decode: treat original as
+            // base64, output the UTF-8 text it represents.
+            return direction == "encode" ? Buffer.from(original).toString("base64") : Buffer.from(original, "base64").toString();
+        } catch (err) {
+            // E.g. malformed base64 input on decode — wrap with context and throw.
+            const errText = `Converting:\n[${original}]\n  ${direction == "encode" ? "to" : "from"} base64:\n {${Utils.errorMessage(err)}}`;
+            Log.logErrorAndThrow(errText);
+        }
+    }
+
     // ── JWT ───────────────────────────────────────────────────────────────────
 
     /**
@@ -1131,16 +1198,34 @@ export class Utils {
             Log.writeLine(LogLevels.FrameworkDebug, `Payload is JSON [${typeof payloadData === "string" ? "string" : "object"}]`);
             payload = typeof payloadData === "string" ? JsonUtils.parse(payloadData, true) : payloadData;
         } else {
-            Log.writeLine(LogLevels.Error, `Payload is NOT JSON (may be intended by test): [${payloadData}]`);
+            // Logged via safeStringify, not raw interpolation — payloadData is caller-supplied
+            // and could be arbitrarily large (or, if a string, isn't guaranteed small either),
+            // so its content must stay size-bounded here even though showing it is genuinely
+            // useful for a test author diagnosing why signing didn't do what they expected.
+            Log.writeLine(LogLevels.Error, `Payload is NOT JSON (may be intended by test): [${Utils.safeStringify(payloadData)}]`);
             payload = payloadData;
         }
 
-        // Signatures/private keys are sometimes passed with literal "\\n" sequences (e.g. from
+        // Signatures/private keys are sometimes passed with literal "\n" sequences (e.g. from
         // an env var or a single-line config value) standing in for real newlines — normalise
         // those back to actual newline characters before use (multi-line PEM keys need real
         // newlines to parse correctly).
-        const normalizedSignature = StringUtils.replaceAll(signature, '\\\\n', '\n');
-        Log.writeLine(LogLevels.FrameworkDebug, `Signature: ${normalizedSignature}`);
+        //
+        // Bug fixed during this readability pass: the search string here was '\\\\n' (a
+        // double-escaped backslash-n, i.e. two literal backslash characters followed by 'n')
+        // instead of '\\n' (one literal backslash followed by 'n') — so on the exact real-world
+        // case this comment describes (a PEM key stored as a single-line env var using ordinary,
+        // single-escaped "\n"), replaceAll found no matches at all, and the key was passed to
+        // jwtSign with its literal backslash-n text still intact instead of real newlines —
+        // which jsonwebtoken's PEM parser (for RS256/ES256/etc, anything other than the HS256
+        // default) would reject as not being a valid key.
+        const normalizedSignature = StringUtils.replaceAll(signature, '\\n', '\n');
+        // Never log the signature itself — it's a signing secret or private key, not ordinary
+        // test data, and logging its actual content would leak that credential into the log
+        // file. Only its length is reported, just enough to sanity-check the normalisation step
+        // above actually ran (a PEM key round-tripped through literal "\\n" handling should come
+        // out noticeably longer once real newlines are restored).
+        Log.writeLine(LogLevels.FrameworkDebug, `Signature normalised — length ${normalizedSignature.length} (content never logged: this may be a secret or private key)`);
 
         // When options came in as a string, it's JWT header JSON that still needs parsing and
         // wrapping in a `{ header: ... }` shape for jwtSign; when it came in as an object,
@@ -1150,9 +1235,12 @@ export class Utils {
         try {
             return jwtSign(payload, normalizedSignature, jwtHeader);
         } catch (err) {
-            // Render the newlines back to a visible "<NEWLINE>" marker in the error message —
-            // a real embedded newline would otherwise make the logged error harder to read.
-            const errText = `Error creating [${typeof options === 'string' ? options : JSON.stringify(options as object)}] JWT token from [${payloadData}] (signature: [${StringUtils.replaceAll(signature, '\\\\n', '<NEWLINE>')}]): ${Utils.errorMessage(err)}`;
+            // payloadData is shown via safeStringify (bounded length, since it's arbitrary
+            // caller content) — but the signature is never shown at all, not even bounded: it's
+            // a signing secret or private key, and a thrown/logged error is exactly the kind of
+            // place a real credential must never end up. Only its length is reported, enough to
+            // tell "empty/missing" apart from "present but rejected by jsonwebtoken".
+            const errText = `Error creating [${typeof options === 'string' ? options : JSON.stringify(options as object)}] JWT token from [${Utils.safeStringify(payloadData)}] (signature: [length ${normalizedSignature.length}, content never logged]): ${Utils.errorMessage(err)}`;
             Log.logErrorAndThrow(errText);
         }
     }
@@ -1194,7 +1282,11 @@ export class Utils {
             }
             return payload as object;
         } catch (err) {
-            const errText = `Error getting payload from JWT [${jwtToken ?? "<Undefined>"}]: ${Utils.errorMessage(err)}`;
+            // Logged via safeStringify, not raw interpolation — jwtToken is caller-supplied and
+            // isn't guaranteed to be a well-formed, short token (a caller could pass anything),
+            // so its content must stay size-bounded here even though showing it is genuinely
+            // useful for a test author diagnosing a decode failure.
+            const errText = `Error getting payload from JWT [${Utils.isNullOrUndefined(jwtToken) ? "<Undefined>" : Utils.safeStringify(jwtToken)}]: ${Utils.errorMessage(err)}`;
             Log.logErrorAndThrow(errText);
         }
     }
@@ -1263,12 +1355,24 @@ export class Utils {
             // timeout, logging) still needs this guard to avoid running twice.
             let exited = false;
 
+            // Shared teardown once any one of exit/error/timeout/SIGINT has settled this
+            // promise: stop the timeout timer, and remove the SIGINT listener registered below.
+            // Without this, every call to this function would leave its own 'SIGINT' listener
+            // permanently attached to the process-wide `process` object (it's never
+            // removed otherwise) — a long test run making many such calls would accumulate one
+            // live listener per call, eventually hitting Node's MaxListenersExceededWarning, and
+            // a single later Ctrl+C would then re-fire every one of those stale listeners at once.
+            const cleanup = () => {
+                clearTimeout(timeout);
+                process.removeListener('SIGINT', onSigint);
+            };
+
             // Normal case — the process finished on its own before the timeout.
             child.on('exit', (code) => {
                 if (!exited) {
                     Log.writeLine(LogLevels.TestInformation, `Process [${child.pid ?? 'unknown'}] exited. Code: ${code ?? 'undefined!'}`);
                     exited = true;
-                    clearTimeout(timeout);
+                    cleanup();
                     resolve(code ?? -1);
                 }
             });
@@ -1279,17 +1383,18 @@ export class Utils {
                 if (!exited) {
                     Log.writeLine(LogLevels.Error, `Process [${child.pid ?? 'unknown'}] errored:\n${err ?? 'unknown error'}`);
                     exited = true;
-                    clearTimeout(timeout);
+                    cleanup();
                     resolve(-1);
                 }
             });
 
             // If the user Ctrl+C's the test runner itself, make sure the spawned child (and its
             // own descendants) don't keep running as orphaned background processes.
-            process.on('SIGINT', () => {
+            const onSigint = () => {
                 Log.writeLine(LogLevels.Error, `Caught SIGINT (Ctrl+C) — terminating child process [${child.pid ?? 'unknown'}]...`);
                 Utils.terminateBackgroundProcess(child, { signal: 'SIGINT' });
-            });
+            };
+            process.on('SIGINT', onSigint);
 
             // The process didn't exit (or error) within the allotted time — forcibly terminate
             // it (and its descendants) and resolve with -1 to signal the timeout to the caller.
@@ -1298,6 +1403,7 @@ export class Utils {
                     const errMessage = `Timeout — child process [${child.pid ?? 'unknown'}] did not exit within ${timeoutSeconds} seconds`;
                     Log.writeLine(LogLevels.Error, errMessage);
                     exited = true;
+                    cleanup();
                     Utils.terminateBackgroundProcess(child);
                     resolve(-1);
                 }
@@ -1635,9 +1741,16 @@ export class Utils {
         // the thing the real `promise` races against below. The friendlyName, if given, is
         // prefixed onto the rejection message so a timeout error is actually traceable to the
         // operation that caused it.
+        // Build the timeout error's message once, up front, as a plain, fully-formed string —
+        // rather than assembling it via nested template-literal interpolation (as this used to
+        // do), which forced a reader to mentally reconstruct how a bare "T" plus a trailing
+        // "imeout" fragment combine into the word "Timeout" depending on whether friendlyName
+        // was given. This produces the exact same two possible messages, just spelled out
+        // plainly instead of cleverly.
+        const timeoutLabel = Utils.isNullOrUndefined(options?.friendlyName) ? "Timeout" : `${options?.friendlyName}: Timeout`;
         const timeoutPromise = new Promise<T>((_, reject) => {
             timeoutHandle = setTimeout(
-                () => reject(new Error(`${Utils.isNullOrUndefined(options?.friendlyName) ? 'T' : `${options?.friendlyName}: T`}imeout after ${options?.timeoutMS ?? '0'} ms`)),
+                () => reject(new Error(`${timeoutLabel} after ${options?.timeoutMS ?? '0'} ms`)),
                 options?.timeoutMS ?? 0
             );
         });

@@ -3,7 +3,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import type { Duplex } from 'node:stream';
 
-import { Detokeniser, JsonUtils, Log, LogLevels, Utils, ValueExpression, XmlUtils, YamlUtils } from '../index.js';
+import { JsonUtils, Log, LogLevels, Utils, ValueExpression, XmlUtils, YamlUtils } from '../index.js';
 import { RawHttpResponseParser } from './rawHttpResponseParser.js';
 
 /**
@@ -197,15 +197,11 @@ export class APIUtils {
 
     // Validate the request envelope itself before doing anything else — a non-object
     // httpRequest, or a headers value that isn't a non-null object, is always a caller
-    // mistake, never something a test would deliberately want to send.
-    if (Utils.isNullOrUndefined(httpRequest) || typeof httpRequest !== 'object') {
-      const errText = `[httpRequest] ${maybeTargetFriendlyName}must be a non-null object. Is [${Utils.describeValue(httpRequest)}]`;
-      Log.logErrorAndThrow(errText);
-    }
-    if (Utils.isNullOrUndefined(httpRequest.headers) || typeof httpRequest.headers !== 'object') {
-      const errText = `[httpRequest.headers] ${maybeTargetFriendlyName}must be a non-null object. Is [${Utils.describeValue(httpRequest.headers)}]`;
-      Log.logErrorAndThrow(errText);
-    }
+    // mistake, never something a test would deliberately want to send. Utils.assertShape's
+    // "nonNullObject" check already exists for exactly this (non-null, not an array) — reuse
+    // it rather than hand-rolling the same check again here.
+    Utils.assertShape(httpRequest, "nonNullObject", `APIUtils.performRawHTTPOperation${maybeTargetFriendlyName}`, "httpRequest");
+    Utils.assertShape(httpRequest.headers, "nonNullObject", `APIUtils.performRawHTTPOperation${maybeTargetFriendlyName}`, "httpRequest.headers");
     // Required to be *a string*, not a *valid* method — a caller deliberately testing a
     // malformed/unusual method is still free to pass any string (e.g. '', 'GE T'). This
     // only stops the case where method is omitted entirely and would otherwise be sent
@@ -214,6 +210,18 @@ export class APIUtils {
     // No timeout given — fall back to the package default rather than waiting forever.
     if (Utils.isNullOrUndefined(httpRequest.timeout)) {
       httpRequest.timeout = API_DEFAULT_TIMEOUT;
+    } else {
+      // A timeout was explicitly given — it must actually be a number, not just typed as
+      // one at compile time. Without this check, a caller passing the wrong type would
+      // misbehave silently deep inside Utils.timeoutPromise instead of failing clearly,
+      // right here, with a message that says exactly what was wrong.
+      Utils.assertType(httpRequest.timeout, "number", "APIUtils.performRawHTTPOperation", "httpRequest.timeout");
+    }
+    // A proxy, if given at all, must be a URL string — connectThroughProxy immediately
+    // does `new URL(proxyUriString)` on it, which would otherwise throw a generic,
+    // unattributed TypeError instead of this clear, attributed one.
+    if (!Utils.isNullOrUndefined(httpRequest.proxy)) {
+      Utils.assertType(httpRequest.proxy, "string", "APIUtils.performRawHTTPOperation", "httpRequest.proxy");
     }
 
     let socket: Duplex | undefined;
@@ -806,6 +814,20 @@ export class APIUtils {
   public static buildURL(
     urlParts: Pick<APIUtils.HTTPRequest, 'protocol' | 'host' | 'resourcePath' | 'queryString'>
   ): string {
+    // These three are about to be concatenated/regex-replaced directly — a wrong type here
+    // (e.g. a caller-built urlParts with a missing field) would otherwise fail deep inside
+    // with a generic "Cannot read properties of undefined" rather than this clear,
+    // attributed error naming exactly which field was wrong.
+    Utils.assertType(urlParts.protocol, "string", "APIUtils.buildURL", "urlParts.protocol");
+    Utils.assertType(urlParts.host, "string", "APIUtils.buildURL", "urlParts.host");
+    Utils.assertType(urlParts.resourcePath, "string", "APIUtils.buildURL", "urlParts.resourcePath");
+    // queryString is optional — only validated when actually supplied. Without this,
+    // a wrong-typed queryString wouldn't fail until mergeQueryStrings calls .startsWith()
+    // on it below, with a generic, unattributed TypeError instead of a clear one naming
+    // exactly which field was wrong.
+    if (!Utils.isNullOrUndefined(urlParts.queryString)) {
+      Utils.assertType(urlParts.queryString, "string", "APIUtils.buildURL", "urlParts.queryString");
+    }
     // Strip ALL leading slashes (not just one) before resolving as a relative reference.
     // A resourcePath starting with "//" would otherwise be parsed by URL as a network-path
     // reference (RFC 3986) — silently replacing the *host* rather than staying a literal
@@ -881,22 +903,19 @@ export class APIUtils {
    * (extraction/comparison), not something this helps with.
    *
    * `modifications` values are applied as-is, via {@link JsonUtils.updateJSONObject}/
-   * {@link XmlUtils.updateXMLDocument} — resolving a DataTable cell's own cast syntax
+   * {@link XmlUtils.updateXMLDocument} — resolving a raw value's own cast syntax
    * (`file:`/`number:`/etc.) is the caller's job, before building this array; a value arriving
-   * here is assumed already fully resolved, and is never itself detokenised. `kind: 'yaml'`
+   * here is assumed already fully resolved. `kind: 'yaml'`
    * reuses {@link JsonUtils.updateJSONObject} too, not a separate "YAMLPath" mechanism — YAML
    * parses down to the exact same plain-object/array/scalar tree JSON does, so the same
    * `JSON-Path`/`Value` convention applies unchanged.
    *
-   * Any token embedded directly in `literalBody` is resolved via {@link Detokeniser.doAsync}
-   * with `{ deEscape: false }` — this is an intermediate pass, not the final one. Escape
-   * sequences are deliberately left intact for the final pass further downstream (at the
-   * point the request actually gets sent) to resolve exactly once — see {@link Detokeniser}'s
-   * own "Escaping" section for why that matters.
+   * No token resolution happens here — `literalBody` and every `modifications` value are
+   * used exactly as given, verbatim.
    *
-   * @param kind - `'json'`/`'xml'`/`'yaml'` parse `literalBody`, apply `modifications`,
-   *   detokenise, then serialise back to a string. `'text'` is detokenised and returned
-   *   verbatim — never parsed or mutated, matching this package's "opaque text" convention.
+   * @param kind - `'json'`/`'xml'`/`'yaml'` parse `literalBody`, apply `modifications`, then
+   *   serialise back to a string. `'text'` is returned verbatim — never parsed or mutated,
+   *   matching this package's "opaque text" convention.
    * @param literalBody - The literal body text, exactly as written in the step/test.
    * @param modifications - Path/value overrides to apply before serialising. Illegal for
    *   `kind: 'text'` — there's no structure to mutate against an opaque literal.
@@ -933,13 +952,13 @@ export class APIUtils {
         const errText = `APIUtils.resolveRequestHTTPBody: [modifications] cannot be applied to kind 'text' — mutating opaque text is a contradiction. Either drop the modifications, or use kind 'json'/'xml'/'yaml' if the body really is structured.`;
         Log.logErrorAndThrow(errText);
       }
-      // Detokenise and return verbatim — never parsed or mutated.
-      return Detokeniser.doAsync(literalBody, { deEscape: false });
+      // Returned verbatim — never parsed or mutated.
+      return literalBody;
     }
 
     if (kind === 'json') {
-      // Parse (optionally JSON5-lenient), apply every path/value override in order, then
-      // detokenise each resulting string leaf before re-serialising to strict JSON text.
+      // Parse (optionally JSON5-lenient), then apply every path/value override in order
+      // before re-serialising to strict JSON text.
       let body: object;
       try {
         body = JsonUtils.parse(literalBody, options?.useJson5 ?? false) as object;
@@ -959,14 +978,13 @@ export class APIUtils {
       for (const { path, value } of modifications ?? []) {
         body = JsonUtils.updateJSONObject(body, path, value);
       }
-      body = (await APIUtils.detokeniseJsonLeaves(body)) as object;
       return JSON.stringify(body);
     }
 
     if (kind === 'yaml') {
       // Same shape as 'json' above — YAML parses to the identical plain-object/array/
-      // scalar tree, so the same JSON-Path-based modification/detokenising logic applies
-      // unchanged; only the final serialisation step differs.
+      // scalar tree, so the same JSON-Path-based modification logic applies unchanged;
+      // only the final serialisation step differs.
       let body: object;
       try {
         body = YamlUtils.parse(literalBody) as object;
@@ -982,18 +1000,13 @@ export class APIUtils {
       for (const { path, value } of modifications ?? []) {
         body = JsonUtils.updateJSONObject(body, path, value);
       }
-      body = (await APIUtils.detokeniseJsonLeaves(body)) as object;
       return YamlUtils.stringify(body);
     }
 
-    // kind === 'xml'. Detokenised *before* parsing, not after serialising — XML text content
-    // (unlike a JSON string value) has no quote-escaping convention to corrupt, so this is
-    // safe, and it lets XmlUtils.parse validate the resolved text's well-formedness, rather
-    // than splicing unescaped characters straight into already-serialised, already-valid output.
-    const detokenisedLiteral = await Detokeniser.doAsync(literalBody, { deEscape: false });
+    // kind === 'xml'.
     let doc: ReturnType<typeof XmlUtils.parse>;
     try {
-      doc = XmlUtils.parse(detokenisedLiteral);
+      doc = XmlUtils.parse(literalBody);
     } catch (err) {
       // Same reasoning as the 'json' branch above — see its own comment.
       Log.logErrorAndThrow(
@@ -1016,39 +1029,9 @@ export class APIUtils {
   }
 
   /**
-   * Recursively detokenises every string leaf of a parsed JSON value, in place conceptually
-   * (returns a new structure) — used by {@link APIUtils.resolveRequestHTTPBody} so a token
-   * embedded in the base literal is resolved against the *already-parsed* leaf text, not the
-   * raw JSON source (where a token's own quoted parameters, e.g.
-   * `[[setting|processEnvName: "X"]]`, would still carry whatever escaping the outer JSON
-   * string needed — parsing first is what correctly unescapes down to the token's real text).
-   */
-  private static async detokeniseJsonLeaves(value: unknown): Promise<unknown> {
-    // String leaf — this is the actual base case: detokenise its text directly.
-    if (typeof value === 'string') {
-      return Detokeniser.doAsync(value, { deEscape: false });
-    }
-    // Array — recurse into every element, preserving order and index.
-    if (Array.isArray(value)) {
-      return Promise.all(value.map((item) => APIUtils.detokeniseJsonLeaves(item)));
-    }
-    // Plain object (not null, not an array, not a primitive) — recurse into every value,
-    // keeping each key unchanged, then rebuild the object from the resolved entries.
-    if (!Utils.isNullOrUndefined(value) && typeof value === 'object') {
-      const entries = await Promise.all(
-        Object.entries(value).map(async ([key, entryValue]) => [key, await APIUtils.detokeniseJsonLeaves(entryValue)] as const)
-      );
-      return Object.fromEntries(entries);
-    }
-    // Any other primitive (number, boolean, null, undefined) — nothing to detokenise,
-    // return as-is.
-    return value;
-  }
-
-  /**
    * Resolves a literal request body of the given kind to the final string a caller sends on
    * the wire, plus the `Content-Type` that body kind implies — thin convenience over
-   * {@link resolveRequestHTTPBody}, which does the actual parse/mutate/detokenise/serialise
+   * {@link resolveRequestHTTPBody}, which does the actual parse/mutate/serialise
    * work. Runner-agnostic: `modifications` is already the plain, resolved shape
    * {@link resolveRequestHTTPBody} itself takes — however a caller got there (a Cucumber
    * DataTable's rows via {@link resolveRequestBodyModifications}, a Jest/Vitest test's own
@@ -1083,8 +1066,15 @@ export class APIUtils {
     modifications?: APIUtils.RequestBodyModification[]
   ): Promise<{ body: string; contentType: string | undefined }> {
     if ((bodyKind ?? 'text') === 'text') {
-      if (!Utils.isUndefined(modifications)) {
-        throw new Error(
+      // Only reject a genuinely non-empty modifications list — matches
+      // resolveRequestHTTPBody's own kind:'text' check (`modifications && modifications.length > 0`)
+      // below it in this file. An empty array has nothing to apply, so it's harmless and
+      // shouldn't be treated the same as a caller actually trying to mutate opaque text.
+      if (modifications && modifications.length > 0) {
+        // Same validation/logging path every other rejection in this file uses — see
+        // Log.logErrorAndThrow's own doc comment for why a plain `throw new Error` is
+        // avoided here: it would bypass the framework's own logging entirely.
+        Log.logErrorAndThrow(
           'APIUtils.resolveLiteralRequestBody: [modifications] can only be used with "json", "xml" or "yaml" body kind.'
         );
       }
@@ -1106,24 +1096,30 @@ export class APIUtils {
       return { body, contentType: APIUtils.APPLICATION_YAML };
     }
 
-    throw new Error('APIUtils.resolveLiteralRequestBody: [bodyKind] can only be text (default), xml, json or yaml');
+    // Same validation/logging path every other rejection in this file uses — see the
+    // 'text' branch above's own comment for why a plain `throw new Error` is avoided.
+    // Utils.describeValue (type/shape only, never the value's own content) is enough here
+    // since bodyKind can only ever be a short string/primitive, never unbounded text.
+    Log.logErrorAndThrow(
+      `APIUtils.resolveLiteralRequestBody: [bodyKind] can only be text (default), xml, json or yaml. Received [${Utils.describeValue(bodyKind)}]`
+    );
   }
+
+
 
   /**
    * Loads a file's raw bytes for a `'bin'` request body — the binary counterpart to
    * {@link resolveLiteralRequestBody}, for genuinely binary content (an image, an archive,
-   * deliberately malformed bytes) that could never be typed as Gherkin/test-literal text in
-   * the first place. Only `filename` — the path itself — may carry a token, resolved exactly
-   * the way {@link ValueExpression}'s own `file:` source verb resolves any other file path
-   * (detokenise, then resolve against the configured test-data root); the loaded bytes
-   * themselves are returned completely untouched — no detokenising, no trimming, no parsing —
+   * deliberately malformed bytes) that could never be typed as test-literal text in
+   * the first place. `filename` is used exactly as given — no token resolution; the loaded
+   * bytes themselves are also returned completely untouched — no trimming, no parsing —
    * since any of those would corrupt binary content that has no text grammar to apply them to.
-   * `modifications`/DataTable overrides have no equivalent here either, for the same reason
+   * `modifications` overrides have no equivalent here either, for the same reason
    * `'text'` has none (see {@link resolveRequestHTTPBody}'s own `kind: 'text'` handling) —
    * opaque bytes have no structure to mutate.
    *
    * @param filename - The file path, relative to the configured test-data root (see
-   *   {@link Utils.resolveTestDataPath}) — may itself contain a token.
+   *   {@link Utils.resolveTestDataPath}), used verbatim.
    * @returns The file's raw bytes as a `Buffer`, plus the implied `Content-Type`
    *   (`'application/octet-stream'`, binary data's own IANA-registered default — RFC 2046
    *   §4.5.1 — same "imply one unless the caller already set a header" convention
@@ -1132,8 +1128,7 @@ export class APIUtils {
    */
   public static async resolveBinaryFileRequestBody(filename: string): Promise<{ body: Buffer; contentType: string }> {
     Utils.assertType(filename, "string", "APIUtils.resolveBinaryFileRequestBody", "filename");
-    const detokenisedFilename = await Detokeniser.doAsync(filename);
-    const resolvedPath = Utils.resolveTestDataPath(detokenisedFilename);
+    const resolvedPath = Utils.resolveTestDataPath(filename);
     const body = Utils.getFileContentsBuffer(resolvedPath);
     return { body, contentType: APIUtils.APPLICATION_OCTET_STREAM };
   }
@@ -1283,7 +1278,7 @@ export namespace APIUtils {
 
   /**
    * A single path/value override for {@link APIUtils.resolveRequestHTTPBody} — e.g. a
-   * DataTable row's `JSON-Path`/`XPath` and (already-resolved) `Value` columns, converted to
+   * table row's `JSON-Path`/`XPath` and (already-resolved) `Value` columns, converted to
    * this plain, runner-agnostic shape by the caller.
    */
   export type RequestBodyModification = {

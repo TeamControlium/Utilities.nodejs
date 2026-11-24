@@ -22,6 +22,11 @@ describe("XmlUtils.isXml", () => {
     expect(XmlUtils.isXml(undefined)).toBe(false);
     expect(XmlUtils.isXml(null)).toBe(false);
   });
+
+  it("returns false for a non-document, non-string object (regression: used to wrongly return true, since .documentElement reads back as undefined — not the null Utils.isNull was checking for — on anything that isn't a real XmlDocument)", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(XmlUtils.isXml({} as any)).toBe(false);
+  });
 });
 
 describe("XmlUtils.parse / XmlUtils.serialize", () => {
@@ -281,5 +286,56 @@ describe("XmlUtils.updateXMLDocument", () => {
       expect(() => XmlUtils.updateXMLDocument(XmlUtils.parse("<root/>"), "/root/X[last()]/Y", "x"))
         .toThrow(/not a plain element name, an attribute \(@name\), or a preceding-sibling::\/following-sibling:: step/);
     });
+  });
+});
+
+describe("XmlUtils.transformAllValues", () => {
+
+  it("rewrites a single element's text content", async () => {
+    const doc = XmlUtils.parse("<a>2</a>");
+    const result = await XmlUtils.transformAllValues(doc, async (value) => `[${value}]`);
+    expect(XmlUtils.serialize(result)).toBe("<a>[2]</a>");
+  });
+
+  it("rewrites an attribute value", async () => {
+    const doc = XmlUtils.parse("<a b='1'/>");
+    const result = await XmlUtils.transformAllValues(doc, async (value) => `[${value}]`);
+    expect(XmlUtils.serialize(result)).toBe('<a b="[1]"/>');
+  });
+
+  it("rewrites both attribute and text values together, at any depth", async () => {
+    const doc = XmlUtils.parse("<root><a id='1'>text-a</a><b><c>text-c</c></b></root>");
+    const result = await XmlUtils.transformAllValues(doc, async (value) => `[${value}]`);
+    expect(XmlUtils.serialize(result)).toBe(
+      '<root><a id="[1]">[text-a]</a><b><c>[text-c]</c></b></root>'
+    );
+  });
+
+  it("rewrites each of several text runs under mixed content independently, never blending them via textContent", async () => {
+    const doc = XmlUtils.parse("<a>one<b/>two</a>");
+    const result = await XmlUtils.transformAllValues(doc, async (value) => `[${value}]`);
+    expect(XmlUtils.serialize(result)).toBe("<a>[one]<b/>[two]</a>");
+  });
+
+  it("leaves an empty element with no attributes or text completely unchanged", async () => {
+    const doc = XmlUtils.parse("<a/>");
+    const result = await XmlUtils.transformAllValues(doc, async (value) => `[${value}]`);
+    expect(XmlUtils.serialize(result)).toBe("<a/>");
+  });
+
+  it("mutates and returns the same document instance, unlike updateXMLDocument's defensive clone", async () => {
+    const doc = XmlUtils.parse("<a>1</a>");
+    const result = await XmlUtils.transformAllValues(doc, async (value) => value);
+    expect(result).toBe(doc);
+  });
+
+  it("throws if document is not a non-null object", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect(XmlUtils.transformAllValues(undefined as any, async (v) => v)).rejects.toThrow();
+  });
+
+  it("throws if transform is not a function", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect(XmlUtils.transformAllValues(XmlUtils.parse("<a/>"), "not a function" as any)).rejects.toThrow();
   });
 });

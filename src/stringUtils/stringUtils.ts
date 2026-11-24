@@ -20,17 +20,15 @@ export class StringUtils {
 
     // Check we have only been given a single char to trim.  Bomb if not.
     if (characterToTrim.length !== 1) {
-      const error = `characterToTrim (${characterToTrim}) must be a single character!`;
-      Log.writeLine(LogLevels.Error, ` ${error}`);
-      throw new Error(error);
+      Log.logErrorAndThrow(`characterToTrim (${characterToTrim}) must be a single character!`);
     }
     // characterToTrim is about to be dropped into a regex character class ([...]) — escape
     // the three characters that are special inside one (']' closes the class early, '^' at
     // the start negates it, '\' starts an escape sequence) so each is matched as a literal
-    // character instead of being interpreted as regex syntax.
-    let normalizedCharToTrim = characterToTrim === "]" ? "\\]" : characterToTrim;
-    normalizedCharToTrim = normalizedCharToTrim === "^" ? "\\^" : normalizedCharToTrim;
-    normalizedCharToTrim = normalizedCharToTrim === "\\" ? "\\\\" : normalizedCharToTrim;
+    // character instead of being interpreted as regex syntax. Any other character needs no
+    // escaping inside a character class, so the lookup simply falls back to it unchanged.
+    const charsNeedingRegexEscape: Record<string, string> = { "]": "\\]", "^": "\\^", "\\": "\\\\" };
+    const normalizedCharToTrim = charsNeedingRegexEscape[characterToTrim] ?? characterToTrim;
 
     // Strip any run of the (now-escaped) character from the very start and/or very end of
     // the string, leaving any occurrences in the middle untouched.
@@ -84,11 +82,15 @@ export class StringUtils {
    * Set first character of string to Capital (if Alpha)
    * @param originalString
    * String to set first character
+   * @param searchFirstAlpha - default false
+   * If true, capitalises the first ALPHA character anywhere in the string (e.g. "3abc" ->
+   * "3Abc") instead of always acting on literal index 0.
    * @returns
    * originalString with first character capitalised
    */
   public static capitaliseFirstCharacter(originalString: string, searchFirstAlpha = false): string {
     Utils.assertType(originalString, "string", "capitaliseFirstCharacter", "originalString");
+    Utils.assertType(searchFirstAlpha, "boolean", "capitaliseFirstCharacter", "searchFirstAlpha");
 
     if (searchFirstAlpha) {
       // Capitalise the FIRST alpha character anywhere in the string (not necessarily index
@@ -123,10 +125,11 @@ export class StringUtils {
    * @param limit
    * A value used to limit the number of elements returned in the array. Last element contains rest of string.
    */
-  public static splitRemaining(originalString: string, separator: string, limit: number,doNotSeparateInQuotes = false): string[] {
+  public static splitRemaining(originalString: string, separator: string, limit: number, doNotSeparateInQuotes = false): string[] {
     Utils.assertType(originalString, "string", "splitRemaining", "originalString");
     Utils.assertType(separator, "string", "splitRemaining", "separator");
     Utils.assertType(limit, "number", "splitRemaining", "limit");
+    Utils.assertType(doNotSeparateInQuotes, "boolean", "splitRemaining", "doNotSeparateInQuotes");
 
     // separator must be exactly one character, and limit must be positive.
     if (separator.length === 1 && limit > 0) {
@@ -134,7 +137,7 @@ export class StringUtils {
       // (limit - 1)th part back together, re-joined with the separator — so the FIRST
       // (limit - 1) parts stay split, and everything remaining collapses into one final
       // "remainder" part.
-      const allParts = StringUtils.split(originalString,separator,doNotSeparateInQuotes);
+      const allParts = StringUtils.split(originalString, separator, doNotSeparateInQuotes);
       const partsToMax = allParts.slice(0, limit - 1);
       const partsAfterMax = allParts.slice(limit - 1);
       return partsAfterMax.length > 0 ? partsToMax.concat([partsAfterMax.join(separator)]) : partsToMax;
@@ -153,10 +156,11 @@ export class StringUtils {
    * @param limit
    * A value used to limit the number of elements returned in the array. First element contains start of string.
    */
-  public static splitLeading(originalString: string, separator: string, limit: number,doNotSeparateInQuotes = false): string[] {
+  public static splitLeading(originalString: string, separator: string, limit: number, doNotSeparateInQuotes = false): string[] {
     Utils.assertType(originalString, "string", "splitLeading", "originalString");
     Utils.assertType(separator, "string", "splitLeading", "separator");
     Utils.assertType(limit, "number", "splitLeading", "limit");
+    Utils.assertType(doNotSeparateInQuotes, "boolean", "splitLeading", "doNotSeparateInQuotes");
 
     // Cap limit at the string's own length — a limit bigger than the string could ever
     // produce would otherwise skew the slice math below.
@@ -168,7 +172,7 @@ export class StringUtils {
       // so the LAST (realLimit - 1) parts stay split, and everything before them collapses
       // into one leading "remainder" part (mirror image of splitRemaining, which keeps the
       // leading parts split instead).
-      const allParts = StringUtils.split(originalString,separator,doNotSeparateInQuotes);
+      const allParts = StringUtils.split(originalString, separator, doNotSeparateInQuotes);
       const partsToMax = allParts.slice(0, allParts.length - realLimit + 1);
       const partsAfterMax = allParts.slice(allParts.length - realLimit + 1, allParts.length);
       return partsToMax.length > 0 ? [partsToMax.join(separator)].concat(partsAfterMax) : partsAfterMax;
@@ -189,9 +193,10 @@ export class StringUtils {
    * @returns
    * Array of original string
    */
-  public static split(originalString: string, separator: string, doNotSeparateInQuotes = true):Array<string> {
+  public static split(originalString: string, separator: string, doNotSeparateInQuotes = true): Array<string> {
     Utils.assertType(originalString, "string", "split", "originalString");
     Utils.assertType(separator, "string", "split", "separator");
+    Utils.assertType(doNotSeparateInQuotes, "boolean", "split", "doNotSeparateInQuotes");
 
     // separator must be exactly one character.
     if (separator.length === 1) {
@@ -204,12 +209,17 @@ export class StringUtils {
         // span — a separator character seen while inside quotes is treated as literal text,
         // not a split point, so e.g. `a,"b,c",d` splits into `a`, `b,c`, `d`, not four parts.
 
-        // /\\?.|^$/g matches either a backslash followed by any character (an escape
+        // /\\?.|^$/gs matches either a backslash followed by any character (an escape
         // sequence, kept together as one token so e.g. `\,` isn't mistaken for an
         // unescaped separator) or any single character on its own, or (for an empty
         // string) the empty match at start/end — giving one token per iteration, never
-        // splitting an escape sequence across two tokens.
-        const result = originalString.match(/\\?.|^$/g)?.reduce(
+        // splitting an escape sequence across two tokens. The `s` (dotAll) flag is required
+        // here: without it, `.` does not match line-terminator characters (`\n`, `\r`,
+        // U+2028, U+2029), so a bare newline in the input would match neither alternative
+        // and be silently dropped from the token stream entirely — corrupting the result
+        // by fusing the characters either side of it together. (Bug found and fixed during
+        // this readability pass — see stringUtils.spec.ts's regression test for this case.)
+        const result = originalString.match(/\\?.|^$/gs)?.reduce(
           (workingObject, currentChar) => {
             // currentChar is a quote character (' or ") — toggle quote-tracking: entering
             // a quoted span if not already in one, or closing it if it matches the quote
@@ -225,10 +235,10 @@ export class StringUtils {
             // Only split on the separator when NOT currently inside a quoted span — a
             // separator inside quotes is literal text, not a delimiter.
             if (workingObject.inQuote === "" && currentChar === separator) {
-                // About to close out the current part — strip any wrapping quotes from it
-                // (they were only there to protect its contents from being split) before
-                // starting a fresh, empty part for what comes next.
-                workingObject.array[workingObject.array.length - 1] = StringUtils.trimQuotes(workingObject.array[workingObject.array.length - 1]);
+              // About to close out the current part — strip any wrapping quotes from it
+              // (they were only there to protect its contents from being split) before
+              // starting a fresh, empty part for what comes next.
+              workingObject.array[workingObject.array.length - 1] = StringUtils.trimQuotes(workingObject.array[workingObject.array.length - 1]);
               workingObject.array.push("");
             } else {
               // Not a split point — append this token to the current (last) part, undoing
@@ -239,11 +249,11 @@ export class StringUtils {
             return workingObject;
           },
           { array: [""], inQuote: "" }
-        ).array??[originalString];
+        ).array ?? [originalString];
         // The very last part never went through the "closing out a part" branch above (there's
         // no trailing separator after it), so its wrapping quotes — if any — are stripped here
         // as a final step.
-        result[result.length - 1] = StringUtils.trimQuotes(result[result.length - 1])
+        result[result.length - 1] = StringUtils.trimQuotes(result[result.length - 1]);
         return result;
       } else {
         // Quote-awareness not requested — a plain native split is sufficient.
@@ -253,6 +263,180 @@ export class StringUtils {
       const error = `Seperator [Length was ${separator.length}] must be single character.`;
       Log.logErrorAndThrow(error);
     }
+  }
+
+  /**
+   * Splits a string upto substrings a maximum number of times using the specified separator,
+   * exactly like {@link StringUtils.splitRemaining}, except each of the first `limit - 1`
+   * fields may be wrapped in matching `'...'`/`"..."` quotes to protect a literal occurrence
+   * of `separator` inside it — the final, absorbed field is never quote-processed, same as
+   * plain `splitRemaining`.
+   *
+   * Quoting is purely positional and opt-in: a field is only treated as quoted if its very
+   * first character is `'` or `"` — a quote character anywhere else in a field is ordinary
+   * literal text, exactly as `splitRemaining` already treats it. This is what makes adopting
+   * this method backwards compatible with any existing unquoted usage: nothing changes unless
+   * a field is deliberately opened with a quote character.
+   *
+   * Literal-content rule inside a quoted field is CSV-style doubling, not backslash-escaping:
+   * a doubled quote of the *same* kind the field opened with (`''` inside `'...'`, `""` inside
+   * `"..."`) is a literal quote character and does not end the field; a single, undoubled
+   * instance of that same kind ends it. The opposite quote kind is just literal text inside a
+   * quoted field (e.g. a bare `"` inside a `'...'`-quoted field needs no special handling at
+   * all). After the closing quote, any further characters up to the next unescaped separator
+   * are appended onto the field as-is (POSIX-shell-style adjacency — `'abc'def` → `abcdef`),
+   * rather than being treated as an error.
+   *
+   * @param originalString
+   * String to be split
+   * @param separator
+   * Character to use as separator. If more than one character, function will error.
+   * @param limit
+   * A value used to limit the number of elements returned in the array. Last element contains
+   * rest of string, unsplit and never quote-processed.
+   * @returns
+   * Array of up to `limit` fields, each with its wrapping quotes (if any) removed and any
+   * doubled same-kind quote inside collapsed to one literal quote character.
+   * @throws
+   * If a field opens with a quote character but never finds its matching close before the
+   * next unescaped separator or the end of the string.
+   * @example
+   * StringUtils.splitRemainingQuoted("a|b|c", "|", 2);                 // => ["a", "b|c"]
+   * StringUtils.splitRemainingQuoted("'a|b'|c", "|", 2);               // => ["a|b", "c"]
+   * StringUtils.splitRemainingQuoted(`'it''s a test'|c`, "|", 2);      // => ["it's a test", "c"]
+   * StringUtils.splitRemainingQuoted("'abc'def|c", "|", 2);            // => ["abcdef", "c"]
+   */
+  public static splitRemainingQuoted(originalString: string, separator: string, limit: number): string[] {
+    Utils.assertType(originalString, "string", "splitRemainingQuoted", "originalString");
+    Utils.assertType(separator, "string", "splitRemainingQuoted", "separator");
+    Utils.assertType(limit, "number", "splitRemainingQuoted", "limit");
+
+    // separator must be exactly one character, and limit must be positive — same contract as
+    // splitRemaining.
+    if (separator.length !== 1 || limit <= 0) {
+      const error = `Seperator [Length was ${separator.length}] must be single character and limit [Limit was ${limit}] greater than 0.`;
+      Log.logErrorAndThrow(error);
+    }
+
+    // Fully split first (every field, quote-aware, no limit applied yet — mirrors how
+    // splitRemaining itself builds on a full StringUtils.split before slicing), each field
+    // tagged with where it started in originalString. Needed so the eventual "absorbed
+    // remainder" below can be read back out of originalString verbatim: unlike
+    // splitRemaining's own plain-text fields (where re-joining already-split parts with
+    // `separator` losslessly reconstructs the original), re-joining already-dequoted,
+    // already-doubling-collapsed fields here would NOT reconstruct the original raw text.
+    const allFields = StringUtils.splitAllQuotedFields(originalString, separator);
+
+    // Fewer fields exist than requested — nothing to absorb into a final "remainder" field,
+    // same as splitRemaining's own behaviour when the input doesn't have enough separators
+    // (it returns fewer than `limit` elements rather than padding with empty strings).
+    if (allFields.length <= limit - 1) {
+      return allFields.map((field) => field.value);
+    }
+    // Enough fields exist to need absorbing: the first (limit - 1) are kept as their already
+    // quote-processed values; everything from where field[limit - 1] started onward is taken
+    // verbatim from originalString — raw, unprocessed, exactly like splitRemaining's own
+    // final field.
+    const keptFields = allFields.slice(0, limit - 1).map((field) => field.value);
+    const remainderStartIndex = allFields[limit - 1].startIndex;
+    return keptFields.concat([originalString.substring(remainderStartIndex)]);
+  }
+
+  /**
+   * Fully splits `originalString` on every occurrence of `separator`, quote-aware (see
+   * {@link StringUtils.splitRemainingQuoted}'s own doc comment for the quoting/doubling/
+   * adjacency rules), with no limit — the quote-aware equivalent of a full
+   * {@link StringUtils.split}. Each returned field carries `startIndex`, the position in
+   * originalString where that field began, so a caller needing a verbatim (not
+   * quote-processed) tail can slice directly out of the original text instead of re-joining
+   * already-processed field values.
+   */
+  private static splitAllQuotedFields(originalString: string, separator: string): Array<{ value: string; startIndex: number }> {
+    const fields = new Array<{ value: string; startIndex: number }>();
+    let position = 0;
+    // Always read at least one field, even for an empty string — matches StringUtils.split's
+    // own "" -> [""] behaviour. Keep reading only while the field just read actually ended on
+    // a real separator (nextPosition within the string) rather than running off the end —
+    // running off the end means there's nothing left to start a further field with, matching
+    // native String.split's trailing-separator behaviour (a trailing separator DOES produce
+    // one further, empty field; no trailing separator at all does not).
+    let endedOnSeparator = true;
+    while (endedOnSeparator) {
+      const field = StringUtils.readOneQuotedField(originalString, position, separator);
+      fields.push({ value: field.value, startIndex: position });
+      endedOnSeparator = field.nextPosition <= originalString.length;
+      position = field.nextPosition;
+    }
+    return fields;
+  }
+
+  /**
+   * Reads one `separator`-delimited field starting at `startIndex`, for
+   * {@link StringUtils.splitAllQuotedFields}/{@link StringUtils.splitRemainingQuoted} — see
+   * the latter's own doc comment for the quoting/doubling/adjacency rules this implements.
+   * Not quote-aware at all if the field doesn't open with a quote character: it just reads up
+   * to the next unescaped separator (or the end of the string) verbatim, identical to what a
+   * plain character split would produce.
+   *
+   * `nextPosition` in the result is always either a real index within `originalString` (a
+   * separator was found and consumed — there may be a further field, even an empty one,
+   * starting there) or exactly `originalString.length + 1` (no separator was found — nothing
+   * left to start a further field with). That `+ 1` sentinel, not `originalString.length`
+   * itself, is deliberate: it stays distinguishable from "a separator was found exactly at
+   * the last character," which legitimately produces `nextPosition === originalString.length`.
+   */
+  private static readOneQuotedField(
+    originalString: string,
+    startIndex: number,
+    separator: string
+  ): { value: string; nextPosition: number } {
+    // Field doesn't open with a quote character — the unquoted, backwards-compatible case:
+    // read straight through to the next separator (or the end of the string), no special
+    // handling of any quote character encountered along the way.
+    if (originalString[startIndex] !== "'" && originalString[startIndex] !== '"') {
+      const separatorIndex = originalString.indexOf(separator, startIndex);
+      return separatorIndex === -1
+        ? { value: originalString.substring(startIndex), nextPosition: originalString.length + 1 }
+        : { value: originalString.substring(startIndex, separatorIndex), nextPosition: separatorIndex + 1 };
+    }
+
+    // Field opens with a quote character — scan past it, same kind, tracking for either a
+    // doubled same-kind quote (literal quote char, field continues) or a single, undoubled
+    // one (field's quoted portion ends here).
+    const quoteChar = originalString[startIndex];
+    let value = "";
+    let index = startIndex + 1;
+    let closed = false;
+    while (index < originalString.length) {
+      if (originalString[index] === quoteChar) {
+        if (originalString[index + 1] === quoteChar) {
+          // Doubled same-kind quote — one literal quote character, field continues.
+          value += quoteChar;
+          index += 2;
+          continue;
+        }
+        // Single, undoubled quote of the same kind — the quoted portion ends here.
+        closed = true;
+        index += 1;
+        break;
+      }
+      // Any other character, including the opposite quote kind, is literal content.
+      value += originalString[index];
+      index++;
+    }
+    if (!closed) {
+      const error = `splitRemainingQuoted: unterminated ${quoteChar} quote starting at position ${startIndex} of [${originalString}] — expected a closing ${quoteChar} (doubled ${quoteChar}${quoteChar} for a literal quote character) before the next [${separator}] or end of string.`;
+      Log.logErrorAndThrow(error);
+    }
+    // Past the closing quote: POSIX-shell-style adjacency — any further literal text up to
+    // the next unescaped separator is appended onto the field as-is, not treated as an error.
+    const separatorIndex = originalString.indexOf(separator, index);
+    if (separatorIndex === -1) {
+      value += originalString.substring(index);
+      return { value, nextPosition: originalString.length + 1 };
+    }
+    value += originalString.substring(index, separatorIndex);
+    return { value, nextPosition: separatorIndex + 1 };
   }
 
   /**
@@ -270,7 +454,7 @@ export class StringUtils {
    * Error if badly formed (no trailing close braces etc....)
    */
   public static splitVerbAndParameters(rawCommand: string): { verb: string; parameters: string } {
-    Log.writeLine(LogLevels.FrameworkDebug,`Got string [${rawCommand}]`);
+    Log.writeLine(LogLevels.FrameworkDebug, `Got string [${rawCommand}]`);
     // Presence of an opening bracket at all is what decides whether this command has
     // parameters — a bare verb with no brackets is the no-parameters case, below.
     if (rawCommand.includes("(")) {
@@ -280,9 +464,9 @@ export class StringUtils {
         // Split on the first '(' only (limit 2) so a parameter value that itself contains
         // '(' isn't mistaken for another split point; take everything after it, then drop
         // the single trailing ')'.
-        let paramsPart = StringUtils.splitRemaining(rawCommand,'(',2)[1];
+        let paramsPart = StringUtils.splitRemaining(rawCommand, '(', 2)[1];
         paramsPart = paramsPart.substring(0, paramsPart.length - 1);
-        Log.writeLine(LogLevels.FrameworkDebug,`Parameters are: [${paramsPart}]`);
+        Log.writeLine(LogLevels.FrameworkDebug, `Parameters are: [${paramsPart}]`);
 
         return {
           verb: rawCommand.split("(")[0],
@@ -309,6 +493,8 @@ export class StringUtils {
    */
   public static removeNonAlphaNumeric(originalString: string): string {
     Utils.assertType(originalString, "string", "removeNonAlphaNumeric", "originalString");
+    // Strip every run of characters that is NOT an ASCII letter or digit — punctuation,
+    // whitespace, and any non-ASCII character are all removed.
     return originalString.replace(/[^a-zA-Z0-9]+/g, "");
   }
 
@@ -319,6 +505,7 @@ export class StringUtils {
    */
   public static removeWhitespace(originalString: string): string {
     Utils.assertType(originalString, "string", "removeWhitespace", "originalString");
+    // Strip every run of whitespace (spaces, tabs, newlines, etc.) anywhere in the string.
     return originalString.replace(/\s+/g, "");
   }
 
@@ -338,13 +525,13 @@ export class StringUtils {
     return originalString.replace(
       /[&<>'"]/g,
       (tag) =>
-        ({
-          "&": "&amp;",
-          "<": "&lt;",
-          ">": "&gt;",
-          "'": "&#39;",
-          '"': "&quot;",
-        }[tag] ?? "")
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "'": "&#39;",
+        '"': "&quot;",
+      }[tag] ?? "")
     );
   }
 
@@ -360,12 +547,15 @@ export class StringUtils {
    * Original string with all matching occuranced replaced
    */
   static replaceAll(original: string, searchValue: string, replaceValue: string): string {
-    // original must actually be a string — fail fast and clearly rather than letting
-    // replaceAll throw its own less-informative TypeError on null/undefined below.
-    if (Utils.isNullOrUndefined(original)) {
-      const errText = `Cannot replace [${searchValue}] with [${replaceValue}] Original is null or undefined!`;
-      Log.logErrorAndThrow(errText, {stackOffset: 1});
-    }
+    // All three parameters must actually be strings — fail fast and clearly rather than
+    // letting native replaceAll throw its own less-informative TypeError (or silently
+    // stringify something unexpected) below. (Previously this only checked `original` for
+    // null/undefined, which let a non-string, non-nullish value — e.g. a number — straight
+    // through to `.replaceAll`, crashing with a generic "x.replaceAll is not a function"
+    // instead of this function's own clear error; fixed during this readability pass.)
+    Utils.assertType(original, "string", "replaceAll", "original");
+    Utils.assertType(searchValue, "string", "replaceAll", "searchValue");
+    Utils.assertType(replaceValue, "string", "replaceAll", "replaceValue");
     // Native String.prototype.replaceAll (ES2021+, safe given this package's Node >=22 floor)
     // treats searchValue as a literal, not a pattern — no manual regex/escaping needed.
     return original.replaceAll(searchValue, replaceValue);
@@ -378,8 +568,15 @@ export class StringUtils {
    * @returns
    * Boolean true is empty or with blankspaces, otherwise false
    */
-  static isBlank(text:string):boolean{
-    return Utils.isNullOrUndefined(text) || text.trim().length === 0;
+  static isBlank(text: string): boolean {
+    // null/undefined count as blank too, so that check comes first — anything else that
+    // isn't actually a string (e.g. a number) is a caller error and must be rejected
+    // explicitly, rather than reaching `.trim()` and crashing with an unclear native error.
+    if (Utils.isNullOrUndefined(text)) {
+      return true;
+    }
+    Utils.assertType(text, "string", "isBlank", "text");
+    return text.trim().length === 0;
   }
 
   /**
@@ -445,7 +642,6 @@ export class StringUtils {
    * — `undefined`/omitted means "no override", returning a plain `"\n"` unchanged.
    *
    * `escapeClause` uses `/` as its escape character (not `\`) — deliberately independent of
-   * any other escaping convention in this codebase (e.g. `Detokeniser`'s own `/`-escaping),
    * so this grammar never gets entangled with a different component's own escaping rules.
    * Recognises:
    * - `/n` `/r` `/t` `/b` `/f` `/v` `/0` — the standard C-family/ECMAScript single-letter
@@ -529,6 +725,122 @@ export class StringUtils {
       );
     }
     return resolved;
+  }
+
+
+  /**
+   * Caps `text` at `maxLength` characters. When it doesn't fit, the preferred form replaces
+   * the middle with a marker — keeping a prefix and the final 16 characters of the original
+   * text intact (so a value's distinguishing tail, e.g. a trailing ID, is never lost to
+   * truncation), with the marker itself reporting how many characters the original was. If
+   * `maxLength` is too small to fit that marker plus the kept 16-character end-text, there's
+   * nothing sensible to build the nice form from, so this falls back to a plain hard cut of
+   * `text`'s first `maxLength` characters instead — no marker, no kept end-text, but the
+   * result is still never longer than `maxLength`.
+   *
+   * @param text - The text to cap.
+   * @param maxLength - The maximum length of the result — must be a positive integer.
+   * @returns `text` unchanged if it already fits within `maxLength`; otherwise a string of
+   *   exactly `maxLength` characters — the marker-based form (a prefix, the truncation
+   *   marker naming the original length, and the original's final 16 characters) when
+   *   `maxLength` is large enough to fit it, or a plain hard cut to `maxLength` characters
+   *   when it isn't.
+   * @throws {Error} If `text` isn't a string, or `maxLength` isn't a positive integer. Never
+   *   throws over `maxLength` being merely *too small for the nice form* — that falls back
+   *   to the plain hard cut above instead.
+   *
+   * @example
+   * StringUtils.truncateIfNeeded("short", 100); // => "short" (unchanged — already fits)
+   * StringUtils.truncateIfNeeded("x".repeat(200), 50);
+   * // => "x ... (truncated as 200 too long) xxxxxxxxxxxxxxxx" (exactly 50 characters)
+   * StringUtils.truncateIfNeeded("x".repeat(1000), 5);
+   * // => "xxxxx" (maxLength 5 can't fit the marker, so this is a plain hard cut, not the marker form)
+   */
+  public static truncateIfNeeded(text: string, maxLength: number): string {
+    Utils.assertType(text, "string", "truncateIfNeeded", "text");
+    Utils.assertType(maxLength, "number", "truncateIfNeeded", "maxLength");
+    if (!Number.isInteger(maxLength) || maxLength < 1) {
+      Log.logErrorAndThrow(`truncateIfNeeded: [maxLength] must be a positive integer — received [${maxLength}]`);
+    }
+    const textLength = text.length;
+
+    if (textLength <= maxLength) return text;
+
+    const truncationText = ` ... (truncated as ${textLength} too long) `;
+    const endTextLength = 16;
+    const prefixLength = maxLength - truncationText.length - endTextLength;
+
+    // prefixLength going negative means maxLength can't even fit the marker plus the kept
+    // end-text, so fall back to a plain hard cut of the first maxLength characters instead.
+    // (maxLength is already guaranteed >= 1 by the guard above, so there's no need to
+    // special-case maxLength <= 0 here — that case already threw before reaching this line.)
+    if (prefixLength < 0) {
+      return text.slice(0, maxLength);
+    }
+
+    // Result is always exactly maxLength characters: prefixLength + truncationText.length + endTextLength === maxLength.
+    return `${text.slice(0, prefixLength)}${truncationText}${text.slice(textLength - endTextLength)}`;
+  }
+
+  /**
+   * Named escape for a control character with a familiar, commonly-recognised one — used by
+   * {@link cleanControlChars}'s `'escape'` mode. Every other C0 control character (and
+   * `DEL`) falls back to a `\xNN` hex escape instead (see that method's own doc comment for
+   * why two hex digits always suffice).
+   */
+  private static readonly NAMED_CONTROL_CHAR_ESCAPES: Record<string, string> = {
+    "\0": "\\0",
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\v": "\\v",
+    "\f": "\\f",
+    "\r": "\\r",
+  };
+
+  /**
+   * Handles every control character in `text` — the C0 set (`0x00`–`0x1F`) plus `DEL`
+   * (`0x7F`); this deliberately does **not** also cover the C1 range (`0x80`–`0x9F`), which
+   * is non-printing but not traditionally called a "control character" the way C0/DEL are —
+   * per `mode`:
+   * - `'escape'` — replaces each with a visible escape sequence: a familiar named one
+   *   (`\r`, `\n`, `\t`, `\0`, `\b`, `\f`, `\v`) where one exists, otherwise `\xNN` (e.g.
+   *   `\x01`). Every C0/DEL code point fits in a single byte, so the hex form is always
+   *   exactly two digits — never `\xNNNN`, there's nothing in this range that needs more.
+   * - `'hex'` — replaces each with its literal hex value, `0xNN` (e.g. a CR becomes the
+   *   4-character text `0x0D`) — not a backslash escape sequence, a literal hex notation,
+   *   for a caller that wants the value named explicitly (e.g. in a log line) rather than
+   *   rendered as something a string-literal parser could read back.
+   * - `'strip'` — removes each one outright, replacing it with nothing.
+   *
+   * Only control characters are ever touched — every other character in `text`, however
+   * unusual, passes through completely unchanged.
+   *
+   * @param text - The text to sanitise.
+   * @param mode - `'escape'` / `'hex'` / `'strip'` — see above. Defaults to `'escape'`.
+   * @returns `text` with every control character replaced per `mode`. Unchanged if `text`
+   *   contains no control characters at all.
+   * @throws {Error} If `text` is not a string, or `mode` is not one of the three recognised
+   *   values.
+   *
+   * @example
+   * StringUtils.cleanControlChars("a\r\nb");            // => "a\\r\\nb" (default: "escape")
+   * StringUtils.cleanControlChars("a\x01b", "escape");  // => "a\\x01b"
+   * StringUtils.cleanControlChars("a\r\nb", "hex");     // => "a0x0D0x0Ab"
+   * StringUtils.cleanControlChars("a\r\nb", "strip");   // => "ab"
+   */
+  static cleanControlChars(text: string, mode: "escape" | "hex" | "strip" = "escape"): string {
+    Utils.assertType(text, "string", "cleanControlChars", "text");
+    if (mode !== "escape" && mode !== "hex" && mode !== "strip") {
+      Log.logErrorAndThrow(`cleanControlChars: [mode] must be 'escape', 'hex' or 'strip' — received [${Utils.describeValue(mode)}]`);
+    }
+    // eslint-disable-next-line no-control-regex
+    return text.replace(/[\x00-\x1F\x7F]/g, (char) => {
+      if (mode === "strip") return "";
+      const hex = char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+      if (mode === "hex") return `0x${hex}`;
+      return this.NAMED_CONTROL_CHAR_ESCAPES[char] ?? `\\x${hex}`;
+    });
   }
 
 }

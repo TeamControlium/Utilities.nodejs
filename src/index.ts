@@ -56,3 +56,5 @@ export { Settings } from "./settings/settings.js";
 export { Detokeniser } from "./detokeniser/detokeniser.js";
 
 export { ValueExpression } from "./valueExpression/valueExpression.js";
+
+export { Validate } from "./validation/validate.js";

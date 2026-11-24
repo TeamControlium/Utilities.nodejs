@@ -181,4 +181,8 @@ describe("RawHttpResponseParser.parseFramingHeaders", () => {
     expect(RawHttpResponseParser.parseFramingHeaders(buf("Content-Length: -5\r\n")).contentLength).toBeNull();
     expect(RawHttpResponseParser.parseFramingHeaders(buf("Content-Length: abc\r\n")).contentLength).toBeNull();
   });
+
+  it("treats an empty Content-Length value as absent, not as an explicit 0 (Number('') === 0 gotcha)", () => {
+    expect(RawHttpResponseParser.parseFramingHeaders(buf("Content-Length: \r\n")).contentLength).toBeNull();
+  });
 });

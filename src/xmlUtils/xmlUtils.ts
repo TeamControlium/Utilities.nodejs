@@ -1,5 +1,5 @@
 import { parseXmlDocument, XMLSerializer } from "slimdom";
-import type { Attr as RawXmlAttr, Document as RawXmlDocument, Element as RawXmlElement, Node as RawXmlNode } from "slimdom";
+import type { Attr as RawXmlAttr, Document as RawXmlDocument, Element as RawXmlElement, Node as RawXmlNode, Text as RawXmlText } from "slimdom";
 import fontoxpath from "fontoxpath";
 import { XMLValidator } from "fast-xml-parser";
 import xmlFormatterImport from "xml-formatter";
@@ -27,6 +27,7 @@ export type XmlDocument = RawXmlDocument;
 
 const ELEMENT_NODE = 1;
 const ATTRIBUTE_NODE = 2;
+const TEXT_NODE = 3;
 
 /**
  * A bare name, permissive about a single namespace prefix (`a:foo`) — this package never
@@ -127,8 +128,16 @@ export class XmlUtils {
       return false;
     }
     // Already a parsed document — valid iff it actually has a root element.
+    //
+    // Bug fixed during this readability pass: this used Utils.isNull (which only checks for
+    // a literal `null`), not Utils.isNullOrUndefined — so a caller passing something that
+    // merely LOOKS like an XmlDocument at the type level but isn't one at runtime (e.g. a
+    // plain `{}`, where `.documentElement` reads back as `undefined`, not `null`) was
+    // wrongly reported as valid XML, since `!Utils.isNull(undefined)` is `true`. A real
+    // slimdom XmlDocument with no root element (which DOM defines as `null`, not
+    // `undefined`) is still correctly rejected either way.
     if (typeof item !== "string") {
-      return !Utils.isNull(item.documentElement);
+      return !Utils.isNullOrUndefined(item.documentElement);
     }
     // A string — delegate to fast-xml-parser's own well-formedness check.
     return XMLValidator.validate(item) === true;
@@ -413,6 +422,46 @@ export class XmlUtils {
       throw new Error(errText);
     }
   }
+
+  /**
+   * Walks every attribute value and text-node value in `document`, replacing each with
+   * whatever `transform` returns for it. The XML counterpart to walking a plain JSON
+   * object's string leaves — XML has no such plain-object shape (`document` is a real DOM
+   * tree), so this walks `childNodes`/`attributes` directly rather than `Object.entries`.
+   *
+   * Deliberately generic: this class knows nothing about *why* a caller wants every value
+   * rewritten (it is never called from anywhere else in this package) — `transform` is
+   * supplied entirely by the caller, so this stays exactly as policy-free as every other
+   * `XmlUtils` method, usable for detokenisation or any other whole-document value rewrite
+   * a future caller might need.
+   *
+   * Operates on individual text-node `data`, not an element's aggregate `textContent` — an
+   * element with mixed content (text and child elements as siblings) therefore has only its
+   * actual text runs rewritten, each child element still walked independently; this is more
+   * precise than rewriting a whole subtree's concatenated text as one unit.
+   *
+   * Mutates `document` in place and returns it — unlike {@link updateXMLDocument}, which
+   * clones defensively because it's rewriting a document a caller may still hold a
+   * reference to elsewhere. Safe here because a caller passes in a document it owns
+   * exclusively and temporarily — typically one just parsed for this one walk, with nothing
+   * else referencing it.
+   *
+   * @param document - The document to walk.
+   * @param transform - Called once per attribute value and once per text-node value;
+   *   its return value replaces the original.
+   * @returns `document`, mutated in place.
+   * @throws {Error} If `document` is not a non-null object, or `transform` is not a function.
+   *
+   * @example
+   * await XmlUtils.transformAllValues(XmlUtils.parse("<a b='1'>2</a>"), async (v) => `[${v}]`);
+   * // => document serialising to "<a b='[1]'>[2]</a>"
+   */
+  static async transformAllValues(document: XmlDocument, transform: (value: string) => Promise<string>): Promise<XmlDocument> {
+    Utils.assertShape(document, "nonNullObject", "XmlUtils.transformAllValues", "document");
+    Utils.assertType(transform, "function", "XmlUtils.transformAllValues", "transform");
+    await transformNodeValues(document, transform);
+    return document;
+  }
 }
 
 /** The node whose `xmlns:*` declarations are searched to resolve a prefix — see {@link selectNodes}. */
@@ -482,6 +531,27 @@ function setNodeValue(node: RawXmlNode, value: string): void {
     (node as RawXmlAttr).value = value;
   } else {
     node.textContent = value;
+  }
+}
+
+/**
+ * Recursively rewrites every attribute value and text-node value under (and including)
+ * `node` via `transform` — see {@link XmlUtils.transformAllValues}'s own doc comment for
+ * the full rationale. Depth-first: an element's own attributes are rewritten before its
+ * children are visited; sibling/child order otherwise follows document order.
+ */
+async function transformNodeValues(node: RawXmlNode, transform: (value: string) => Promise<string>): Promise<void> {
+  if (node.nodeType === ELEMENT_NODE) {
+    const element = node as RawXmlElement;
+    for (const attr of element.attributes) {
+      attr.value = await transform(attr.value);
+    }
+  } else if (node.nodeType === TEXT_NODE) {
+    const text = node as RawXmlText;
+    text.data = await transform(text.data);
+  }
+  for (const child of Array.from(node.childNodes)) {
+    await transformNodeValues(child, transform);
   }
 }
 
