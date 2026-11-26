@@ -13,14 +13,16 @@ const MockUtils = {
  * built-in handler.
  *
  * ```
- * [[mockintercepts|$.requests[0].body.userId]]
+ * <%mockintercepts|$.requests[0].body.userId%>
  * ```
  */
 
-export function builtinMockRequests(context: Detokeniser.CallbackContext): string {
-  // 'mockintercepts' needs a JSONPath expression to harvest from intercepted requests.
-  if (StringUtils.isBlank(context.args)) throw new Error(`Request token [${context.rawVerb}] needs 2 parts {{mockintercepts;JSONPath}}`);
-  return doMockRequests(context.args);
+export function builtinMockRequests(context: Detokeniser.VerbContext): string {
+  // 'mockintercepts' needs a JSONPath expression to harvest from intercepted requests. Never
+  // split any further by this verb, so safe to resolve markers immediately, before use.
+  if (StringUtils.isBlank(context.args))
+    throw new Error(`Request token [${context.rawVerb}] needs 2 parts ${context.tokenStart}mockintercepts${context.delimiter}JSONPath${context.tokenEnd}`);
+  return doMockRequests(context.resolveMarkers(context.args));
 }
 
 function doMockRequests(jsonPath: string): string {

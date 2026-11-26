@@ -11,39 +11,47 @@ import { findLeadingParenCall } from "./verbArgGrammar.js";
  *
  * | Expression | Format | Example | Sample output |
  * |---|---|---|---|
- * | `digits` | count | `[[random\|digits\|6]]` | `482910` |
- * | `letters` | count | `[[random\|letters\|4]]` | `xKpQ` |
- * | `lowercaseletters` | count | `[[random\|lowercaseletters\|4]]` | `xkpq` |
- * | `uppercaseletters` | count | `[[random\|uppercaseletters\|4]]` | `XKPQ` |
- * | `alphanumerics` | count | `[[random\|alphanumerics\|8]]` | `a3Kx92Zp` |
- * | `from(<chars>)` | count (exact), required | `[[random\|from(aeiou)\|3]]` | `ioa` |
- * | `from('a','b',...)` | max total characters, optional (default: no limit) | `[[random\|from('cat','dog')\|3]]` | `cat` or `dog` |
- * | `float(min,max)` | decimal places | `[[random\|float(1.5,3.7)\|2]]` | `2.83` |
- * | `date(fromEpoch,toEpoch)` | date format | `[[random\|date(0,1700000000000)\|yyyy-MM-dd]]` | `1994-07-12` |
+ * | `digits` | count, optional (default: 1) | `<%random\|digits\|6%>` | `482910` |
+ * | `letters` | count, optional (default: 1) | `<%random\|letters\|4%>` | `xKpQ` |
+ * | `lowercaseletters` | count, optional (default: 1) | `<%random\|lowercaseletters\|4%>` | `xkpq` |
+ * | `uppercaseletters` | count, optional (default: 1) | `<%random\|uppercaseletters\|4%>` | `XKPQ` |
+ * | `alphanumerics` | count, optional (default: 1) | `<%random\|alphanumerics\|8%>` | `a3Kx92Zp` |
+ * | `from(<chars>)` | count (exact), optional (default: 1) | `<%random\|from(aeiou)\|3%>` | `ioa` |
+ * | `from('a','b',...)` | max total characters, optional (default: no limit) | `<%random\|from('cat','dog')\|3%>` | `cat` or `dog` |
+ * | `float(min,max)` | decimal places | `<%random\|float(1.5,3.7)\|2%>` | `2.83` |
+ * | `date(fromEpoch,toEpoch)` | date format | `<%random\|date(0,1700000000000)\|yyyy-MM-dd%>` | `1994-07-12` |
  *
  * `from(...)` has two distinct modes, chosen purely by whether its content opens with a
  * quote character (`'`/`"`) — see {@link parseFromQuotedStringList}'s own doc comment, and
  * `docs/design/random-from-quoted-string-lists.md`, for the full grammar, the fallback
  * behaviour when a quoted list is malformed, and why `<length>` means something different
- * (a cap, not an exact count) in that mode. The `<length>`/cap is also only ever optional in
- * quoted-string-list mode — character-pool mode (from(<chars>)) and every named set still
- * require it explicitly, same as any other random verb, since a pool has no sensible "how
- * many characters" default of its own. Omitted in quoted-string-list mode, it means "pick
- * exactly one whole item, however long it is" — never an uncapped fill loop, which could
- * hang against a pool with no empty-string item.
+ * (a cap, not an exact count) in that mode. The `<length>`/count is optional everywhere —
+ * character-pool mode (from(<chars>)) and every named set default an omitted `<length>` to
+ * `1` (a single random character), the same default every other random verb needing a count
+ * now shares. Omitted in quoted-string-list mode, it instead means "pick exactly one whole
+ * item, however long it is" — never an uncapped fill loop, which could hang against a pool
+ * with no empty-string item.
  */
 
-export function builtinRandom(context: Detokeniser.CallbackContext): string {
+export function builtinRandom(context: Detokeniser.VerbContext): string {
   // 'random' needs at least a type and (usually) a length/format argument.
-  if (StringUtils.isBlank(context.args)) throw new Error(`Random token [${context.rawVerb}] needs at least 2 parts (IE. {{random;type[;<length>]}} etc.)`);
-  return doRandomToken(context.args, context.delimiter);
+  if (StringUtils.isBlank(context.args))
+    throw new Error(
+      `Random token [${context.rawVerb}] needs at least 2 parts (IE. ${context.tokenStart}random${context.delimiter}type[${context.delimiter}<length>]${context.tokenEnd} etc.)`
+    );
+  return doRandomToken(context);
 }
 
-function doRandomToken(tokenBody: string, delimiter: string): string {
+function doRandomToken(context: Detokeniser.VerbContext): string {
+  const { args: tokenBody, delimiter, escapeChar, resolveMarkers, tokenStart, tokenEnd, rawVerb } = context;
+  // The full original token, sentinel-wrapped exactly as the engine's own active boundary
+  // would render it — used to show a tester the real, failing text in an error, not a bare
+  // "Length was: [undefined]" that forces them to go find the token themselves.
+  const rawToken = `${tokenStart}${rawVerb}${delimiter}${tokenBody}${tokenEnd}`;
 
   ////////////////////////////////////////////////////
   //
-  // Resolves a `[[random|<verb>|<lengthOrFormat>]]` token. The verb selects one of three
+  // Resolves a `<%random|<verb>|<lengthOrFormat>%>` token. The verb selects one of three
   // distinct shapes: date(fromEpoch,toEpoch) → a random epoch formatted per the second
   // part; float(min,max) → a random float truncated/formatted to N decimal places; or one
   // of the character-set verbs (letters/digits/etc, or from(<chars>)) → a random string of
@@ -65,7 +73,12 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
   // mistaken for this verb's own separator — then decide the split from whatever, if
   // anything, comes after it. Every other verb (letters/digits/etc.) never has
   // delimiter-bearing content of its own, so the plain split is still safe for them.
-  const typeAndLengthOrFormat: string[] = splitRandomVerbArgs(tokenBody, delimiter);
+  // splitRandomVerbArgs finds the real type/length boundary on marker-safe text (paren-aware,
+  // so a nested token's resolved value sitting inside e.g. from(...) never corrupts where that
+  // boundary actually is). Only once each piece is isolated is it safe to resolve markers in
+  // it — every further parse below (paren content, quoted-list items) then operates on real
+  // text, including real text that happens to have come from a nested token.
+  const typeAndLengthOrFormat: string[] = splitRandomVerbArgs(tokenBody, delimiter, escapeChar).map(resolveMarkers);
   let result = "";
   let select = "";
   const verb: string = typeAndLengthOrFormat[0].toLowerCase().trim();
@@ -73,7 +86,7 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
   if (verb.startsWith("date(")) {
     // date(fromEpoch,toEpoch) — generate a random epoch in that range, then format it
     // per the second part (or leave it as a raw epoch string if the format is "epoch").
-    const randomDate = doRandomDate(verb.substring(verb.indexOf("(") + 1, verb.indexOf(")")));
+    const randomDate = doRandomDate(verb.substring(verb.indexOf("(") + 1, verb.indexOf(")")), delimiter, tokenStart, tokenEnd);
 
     result = typeAndLengthOrFormat[1].toLowerCase() === "epoch" ? "" + randomDate : format(randomDate, typeAndLengthOrFormat[1]);
   } else if (verb.startsWith("float(")) {
@@ -83,12 +96,14 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
     // digits, 4 decimal places), defaulting to today's decimal-places-only behaviour when
     // only one number is given — a non-breaking change if added.
     if (isNaN(parseInt(typeAndLengthOrFormat[1])))
-      throw new Error(`Invalid Float format. Expect {{random.float(min;max),<number of decimals>}}. Format was: [${typeAndLengthOrFormat[1]}]`);
+      throw new Error(
+        `Decimal-places part invalid in [${rawToken}]. Expect ${tokenStart}random${delimiter}float(min,max)${delimiter}<number of decimals>${tokenEnd}. Was: [${typeAndLengthOrFormat[1]}]`
+      );
     const numberOfDecimalPlaces = parseInt(typeAndLengthOrFormat[1]);
     const powerDPs = Math.pow(10, numberOfDecimalPlaces);
     // Truncate (not round) to the requested number of decimal places, then format with
     // exactly that many digits — guarantees a fixed-width decimal part, not a varying one.
-    result = (Math.trunc(doRandomFloat(verb.substring(verb.indexOf("(") + 1, verb.indexOf(")"))) * powerDPs) / powerDPs).toFixed(numberOfDecimalPlaces);
+    result = (Math.trunc(doRandomFloat(verb.substring(verb.indexOf("(") + 1, verb.indexOf(")")), delimiter, tokenStart, tokenEnd) * powerDPs) / powerDPs).toFixed(numberOfDecimalPlaces);
   } else {
     // Character-set verbs: either a custom from(<chars>)/from('a','b') pool, or one of the
     // fixed named sets below. Exactly one of 'select' (character-pool mode) or
@@ -104,7 +119,7 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
       // parseFromQuotedStringList tolerates it everywhere else in this grammar — commits to
       // quoted-string-list mode; anything else (an ordinary character, or from(...) being
       // empty) stays character-pool mode, unchanged from this verb's original behaviour.
-      stringListItems = /^\s*['"]/.test(fromContent) ? parseFromQuotedStringList(fromContent) : undefined;
+      stringListItems = /^\s*['"]/.test(fromContent) ? parseFromQuotedStringList(fromContent, escapeChar) : undefined;
       if (stringListItems) {
         Log.writeLine(LogLevels.TestDebug, `random|from(...): parsed as quoted string list [${stringListItems.join(", ")}]`);
       } else {
@@ -115,7 +130,7 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
         // the whole, unmodified from(...) text, exactly as if the leading-quote check had
         // never run. See docs/design/random-from-quoted-string-lists.md for why this is a
         // silent fallback rather than a thrown error.
-        select = parseParenContent(typeAndLengthOrFormat[0]);
+        select = parseParenContent(typeAndLengthOrFormat[0], escapeChar);
         Log.writeLine(LogLevels.TestDebug, `random|from(...): using character-pool mode (pool [${select}])`);
       }
     } else {
@@ -140,20 +155,19 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
           throw new Error(`Unrecognised random Type [${typeAndLengthOrFormat[0]}] - Expect letters, lowercaseletters, uppercaseletters digits or alphanumerics`);
       }
     }
-    // The second (length/cap) part is only ever optional in quoted-string-list mode —
-    // character-pool mode (from(<chars>)) and every named set (letters/digits/etc.) still
-    // require it explicitly: a pool, unlike a fixed-item list, has no sensible "how many
-    // characters" default of its own, same reasoning as every other random verb needing it.
+    // The second (length/count) part is optional everywhere now — quoted-string-list mode
+    // treats an omitted length as "pick exactly one whole item"; character-pool mode
+    // (from(<chars>)) and every named set (letters/digits/etc.) treat it as "pick exactly one
+    // random character", the same single-character default every other random verb needing
+    // a count now shares.
     const lengthArgOmitted = Utils.isUndefined(typeAndLengthOrFormat[1]);
-    if (lengthArgOmitted && !stringListItems) {
-      throw new Error(`Invalid length part in Random token {{random;<type>;<length>}}. Length was: [${typeAndLengthOrFormat[1]}]`);
-    }
-    // When given at all (required for character-pool/named-set mode, optional for
-    // quoted-string-list mode), it must be a valid non-negative integer — an exact character
-    // count in character-pool/named-set mode, or a maximum total character count in
-    // quoted-string-list mode (see buildFromStringListResult).
+    // When given at all, it must be a valid non-negative integer — an exact character count
+    // in character-pool/named-set mode, or a maximum total character count in quoted-string-
+    // list mode (see buildFromStringListResult).
     if (!lengthArgOmitted && (isNaN(parseInt(typeAndLengthOrFormat[1])) || parseInt(typeAndLengthOrFormat[1]) < 0))
-      throw new Error(`Invalid length part in Random token {{random;<type>;<length>}}. Length was: [${typeAndLengthOrFormat[1]}]`);
+      throw new Error(
+        `Length part invalid in [${rawToken}]. Expect ${tokenStart}random${delimiter}<type>${delimiter}<length>${tokenEnd}. Was: [${typeAndLengthOrFormat[1]}]`
+      );
 
     if (stringListItems) {
       // Quoted-string-list mode. A given length/cap is a maximum, not an exact count — see
@@ -164,11 +178,11 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
         ? stringListItems[Utils.getRandomInt(0, stringListItems.length - 1)]
         : buildFromStringListResult(stringListItems, parseInt(typeAndLengthOrFormat[1]));
     } else {
-      // Character-pool/named-set mode — length is guaranteed present here (the throw above
-      // already rejected omitting it). Build the result by picking that many characters from
-      // the pool, independently at random each time (so repeats within the result are
-      // allowed).
-      const exactLength = parseInt(typeAndLengthOrFormat[1]);
+      // Character-pool/named-set mode — an omitted length defaults to 1 (a single random
+      // character); otherwise use the given exact count. Build the result by picking that
+      // many characters from the pool, independently at random each time (so repeats within
+      // the result are allowed).
+      const exactLength = lengthArgOmitted ? 1 : parseInt(typeAndLengthOrFormat[1]);
       for (let count = 0; count < exactLength; count++) {
         result += select[Utils.getRandomInt(0, select.length - 1)];
       }
@@ -188,13 +202,17 @@ function doRandomToken(tokenBody: string, delimiter: string): string {
  * content of its own, so a plain delimiter split is always safe for them.
  *
  * @returns One element if `tokenBody` is a bare `date(...)`/`float(...)`/`from(...)` call
- *   with nothing trailing it — only ever valid for `from(...)`'s quoted-string-list mode,
- *   whose length/cap is optional; {@link doRandomToken}'s own length-required check still
- *   rejects this for every other verb. Two elements otherwise: `[type, lengthOrFormat]`.
+ *   with nothing trailing it. Valid for `from(...)` either way it resolves (quoted-string-list
+ *   mode picks one whole item; character-pool mode defaults the omitted length to 1).
+ *   `date(...)`/`float(...)` still need their own second part (a format string / decimal-places
+ *   count respectively — neither is a length {@link doRandomToken} could sensibly default to
+ *   1) — currently an unhandled `TypeError` reading `.toLowerCase()` of `undefined`, not a
+ *   clean verb-specific error; pre-existing, not introduced by the pool-default change above,
+ *   and out of scope here. Two elements otherwise: `[type, lengthOrFormat]`.
  */
-function splitRandomVerbArgs(tokenBody: string, delimiter: string): string[] {
+function splitRandomVerbArgs(tokenBody: string, delimiter: string, escapeChar: string): string[] {
   const trimmedBody = tokenBody.trim();
-  const leadingCall = findLeadingParenCall(trimmedBody);
+  const leadingCall = findLeadingParenCall(trimmedBody, escapeChar);
   // Not a name(...)-shaped call at all (a bare verb like "digits"), or one whose parens never
   // find a matching close (unterminated) — the plain split is exactly right for the former,
   // and lands on the same "Unrecognised random Type"/"Invalid length part" errors
@@ -239,18 +257,19 @@ function splitRandomVerbArgs(tokenBody: string, delimiter: string): string[] {
  *
  * Grammar (see the design doc for the full reasoning): one or more items, each `'...'` or
  * `"..."`, separated by `,`, with incidental whitespace tolerated around each comma and
- * before the first item's opening quote. Inside an item, `/` escapes that item's OWN quote
- * character (e.g. `/'` inside a `'...'` item); the opposite quote character, and structural
- * characters like `)`/`,` that would otherwise end the call or the item, are all just
- * literal content while a quote is open — e.g. `'he)llo'` is the single item `he)llo`, not a
- * truncated `he` followed by a stray `)`.
+ * before the first item's opening quote. Inside an item, the engine's current escape char
+ * (`escapeChar`, never hardcoded — see {@link Detokeniser.EscapeChar}) escapes that item's OWN
+ * quote character (e.g. `` `' `` inside a `'...'` item under the default); the opposite quote
+ * character, and structural characters like `)`/`,` that would otherwise end the call or the
+ * item, are all just literal content while a quote is open — e.g. `'he)llo'` is the single
+ * item `he)llo`, not a truncated `he` followed by a stray `)`.
  *
- * @example parseFromQuotedStringList("'a','b')") → ["a", "b"]
- * @example parseFromQuotedStringList("'he)llo')") → ["he)llo"]
- * @example parseFromQuotedStringList("'he')llo')") → undefined (unescaped ' inside the item
- *   closes it early; what follows — `)llo')` — is neither `,` nor a final-character `)`)
+ * @example parseFromQuotedStringList("'a','b')", "`") → ["a", "b"]
+ * @example parseFromQuotedStringList("'he)llo')", "`") → ["he)llo"]
+ * @example parseFromQuotedStringList("'he')llo')", "`") → undefined (unescaped ' inside the
+ *   item closes it early; what follows — `)llo')` — is neither `,` nor a final-character `)`)
  */
-function parseFromQuotedStringList(content: string): string[] | undefined {
+function parseFromQuotedStringList(content: string, escapeChar: string): string[] | undefined {
   const items: string[] = [];
   let index = 0;
 
@@ -274,7 +293,7 @@ function parseFromQuotedStringList(content: string): string[] | undefined {
     let value = "";
     let closed = false;
     while (index < content.length) {
-      if (content[index] === "/" && index + 1 < content.length) {
+      if (content[index] === escapeChar && index + 1 < content.length) {
         // Escaped character — take the next character literally (this is how a literal
         // occurrence of this item's own quote character gets included), and skip both.
         value += content[index + 1];
@@ -348,11 +367,13 @@ function buildFromStringListResult(items: string[], maxChars: number): string {
 
 /**
  * Extracts the content inside the first set of parentheses in `input`, respecting the
- * default escape char `/`. An escaped `)` (i.e. `/)`) is treated as a literal `)` and does
- * not end the content.
- * @example parseParenContent("from(abc/))") → "abc)"
+ * engine's current escape char (`` ` `` by default — passed in as `escapeChar`, never
+ * hardcoded, so this stays in sync with {@link Detokeniser.EscapeChar} rather than silently
+ * diverging from it). An escaped `)` (i.e. `` `) `` under the default) is treated as a literal
+ * `)` and does not end the content.
+ * @example parseParenContent("from(abc`))", "`") → "abc)"
  */
-function parseParenContent(input: string): string {
+function parseParenContent(input: string, escapeChar: string): string {
   // No opening paren at all — nothing to extract.
   const openParen = input.indexOf("(");
   if (openParen === -1) return "";
@@ -360,9 +381,9 @@ function parseParenContent(input: string): string {
   // Start scanning right after the opening paren.
   let i = openParen + 1;
   while (i < input.length) {
-    if (input[i] === "/" && i + 1 < input.length) {
+    if (input[i] === escapeChar && i + 1 < input.length) {
       // Escaped character — take the character that follows the escape char literally
-      // (e.g. `/)` → literal `)`) and skip both; it never ends the content.
+      // (e.g. `` `) `` → literal `)`) and skip both; it never ends the content.
       result += input[i + 1];
       i += 2;
     } else if (input[i] === ")") {
@@ -386,18 +407,18 @@ function parseParenContent(input: string): string {
  * @throws {Error} If `limits` isn't exactly two comma-separated numbers, or either one isn't
  *   a valid finite number.
  */
-function doRandomFloat(limits: string): number {
+function doRandomFloat(limits: string, delimiter: string, tokenStart: string, tokenEnd: string): number {
   // Expect exactly two comma-separated numbers: "min,max".
   const minimumAndMaximum: string[] = limits.split(",");
 
   if (minimumAndMaximum.length != 2)
-    throw new Error(`Invalid Maximum and Minimum floats. Expect {{random.float(min;max),<format>}}. Max/min was: [${limits}]`);
+    throw new Error(`Invalid Maximum and Minimum floats. Expect ${tokenStart}random${delimiter}float(min,max)${delimiter}<decimals>${tokenEnd}. Max/min was: [${limits}]`);
   const min = parseFloat(minimumAndMaximum[0]);
   const max = parseFloat(minimumAndMaximum[1]);
 
   // Validate min and max separately so the error pinpoints which one is actually invalid.
-  if (isNaN(min)) throw new Error(`Invalid Minimum float. Expect {{random.float(min;max),<format>}}. Max/min was: [${limits}]`);
-  if (isNaN(max)) throw new Error(`Invalid Maximum float. Expect {{random.float(min;max),<format>}}. Max/min was: [${limits}]`);
+  if (isNaN(min)) throw new Error(`Invalid Minimum float. Expect ${tokenStart}random${delimiter}float(min,max)${delimiter}<decimals>${tokenEnd}. Max/min was: [${limits}]`);
+  if (isNaN(max)) throw new Error(`Invalid Maximum float. Expect ${tokenStart}random${delimiter}float(min,max)${delimiter}<decimals>${tokenEnd}. Max/min was: [${limits}]`);
 
   return Utils.getRandomFloat(min, max);
 }

@@ -15,23 +15,23 @@ import { findLeadingParenCall } from "./verbArgGrammar.js";
  *
  * | Expression | Example | Sample output |
  * |---|---|---|
- * | `today` / `now` | `[[date\|today\|dd-MM-yyyy]]` | `01-04-2026` |
- * | `yesterday` | `[[date\|yesterday\|dd-MM-yyyy]]` | `31-03-2026` |
- * | `tomorrow` | `[[date\|tomorrow\|dd-MM-yyyy]]` | `02-04-2026` |
- * | `addYears(n)` | `[[date\|addYears(-1)\|yyyy]]` | `2025` |
- * | `addMonths(n)` | `[[date\|addMonths(3)\|MMM yyyy]]` | `Jul 2026` |
- * | `addDays(n)` | `[[date\|addDays(5)\|dd-MM-yyyy]]` | `06-04-2026` |
- * | `addHours(n)` | `[[date\|addHours(2)\|HH:mm]]` | `14:30` |
- * | `addMinutes(n)` | `[[date\|addMinutes(30)\|HH:mm]]` | `13:00` |
- * | `random(fromEpoch,toEpoch)` | date format | `[[date\|random(0,1700000000000)\|yyyy-MM-dd]]` | random date |
- * | `followingDay(epoch,dayName)` | date format | `[[date\|followingDay(1711929600000,wednesday)\|dd-MM-yyyy]]` | next Wednesday |
- * | `yyyy-MM-dd` _(fixed date)_ | date format | `[[date\|2026-06-15\|EEEE]]` | `Monday` |
+ * | `today` / `now` | `<%date\|today\|dd-MM-yyyy%>` | `01-04-2026` |
+ * | `yesterday` | `<%date\|yesterday\|dd-MM-yyyy%>` | `31-03-2026` |
+ * | `tomorrow` | `<%date\|tomorrow\|dd-MM-yyyy%>` | `02-04-2026` |
+ * | `addYears(n)` | `<%date\|addYears(-1)\|yyyy%>` | `2025` |
+ * | `addMonths(n)` | `<%date\|addMonths(3)\|MMM yyyy%>` | `Jul 2026` |
+ * | `addDays(n)` | `<%date\|addDays(5)\|dd-MM-yyyy%>` | `06-04-2026` |
+ * | `addHours(n)` | `<%date\|addHours(2)\|HH:mm%>` | `14:30` |
+ * | `addMinutes(n)` | `<%date\|addMinutes(30)\|HH:mm%>` | `13:00` |
+ * | `random(fromEpoch,toEpoch)` | date format | `<%date\|random(0,1700000000000)\|yyyy-MM-dd%>` | random date |
+ * | `followingDay(epoch,dayName)` | date format | `<%date\|followingDay(1711929600000,wednesday)\|dd-MM-yyyy%>` | next Wednesday |
+ * | `yyyy-MM-dd` _(fixed date)_ | date format | `<%date\|2026-06-15\|EEEE%>` | `Monday` |
  *
  * An optional 3rd part gives a raw IANA zone name to format in, instead of local time — see
  * `timezone` below for where that string typically comes from:
  * ```
- * [[date|today|HH:mm|Europe/London]]              ← formatted in London time
- * [[date|addDays(1)|dd-MM-yyyy|Asia/Tokyo]]
+ * <%date|today|HH:mm|Europe/London%>              ← formatted in London time
+ * <%date|addDays(1)|dd-MM-yyyy|Asia/Tokyo%>
  * ```
  *
  * Business-day-aware date math (skipping weekends/public holidays) and place-name-to-zone
@@ -45,8 +45,8 @@ import { findLeadingParenCall } from "./verbArgGrammar.js";
  * nested inside `date`/`diff` with the same validation either way gets, whether typed directly or
  * produced by some other token.
  * ```
- * [[timezone|Europe/London]]   →  Europe/London
- * [[timezone|Nowhere/Fake]]    →  throws: not a recognised IANA timezone name
+ * <%timezone|Europe/London%>   →  Europe/London
+ * <%timezone|Nowhere/Fake%>    →  throws: not a recognised IANA timezone name
  * ```
  *
  * ### `diff` — hours between two IANA zones
@@ -54,8 +54,8 @@ import { findLeadingParenCall } from "./verbArgGrammar.js";
  * as a plain decimal number string — e.g. `"5"`, `"-5.5"`, `"5.75"` (Nepal-style quarter-hour
  * zones). "UTC" is itself a valid zone, so this also covers a single zone's offset from UTC.
  * ```
- * [[diff|Europe/London|Africa/Lusaka]]   →  e.g. "-2" (seasonal — Europe/London observes DST)
- * [[diff|Asia/Kathmandu|UTC]]            →  e.g. "5.75"
+ * <%diff|Europe/London|Africa/Lusaka%>   →  e.g. "-2" (seasonal — Europe/London observes DST)
+ * <%diff|Asia/Kathmandu|UTC%>            →  e.g. "5.75"
  * ```
  */
 
@@ -71,44 +71,60 @@ interface DateTokenPreambleReturn {
   // Raw IANA zone name (e.g. "Europe/London"), if the date token's optional 3rd part supplied
   // one — undefined means "format in local time", same as omitting it entirely.
   ianaZone: string | undefined;
+  // Carried through so doDateTokenVerb's own doRandomDate call can build a live-sentinel
+  // error message too, without doDateTokenVerb needing the full VerbContext itself.
+  delimiter: string;
+  tokenStart: string;
+  tokenEnd: string;
 }
 
-export function builtinDate(context: Detokeniser.CallbackContext): string {
+export function builtinDate(context: Detokeniser.VerbContext): string {
   // 'date' needs at least an offset verb and a format (doDateToken enforces the exact
   // shape, including the optional 3rd IANA-zone part) — this just guards against a
   // completely empty body.
   if (StringUtils.isBlank(context.args))
-    throw new Error(`Date token [${context.rawVerb}] needs 2 or 3 parts {{date;<offset>;<format>[;<ianaZone>]}}`);
-  return doDateToken(context.args, context.delimiter);
+    throw new Error(
+      `Date token [${context.rawVerb}] needs 2 or 3 parts ${context.tokenStart}date${context.delimiter}<offset>${context.delimiter}<format>[${context.delimiter}<ianaZone>]${context.tokenEnd}`
+    );
+  return doDateToken(context);
 }
 
-export function builtinTimezone(context: Detokeniser.CallbackContext): string {
-  // 'timezone' needs exactly the IANA zone name to validate.
-  if (StringUtils.isBlank(context.args)) throw new Error(`Timezone token [${context.rawVerb}] needs an IANA zone name (IE. {{timezone;Europe/London}})`);
-  return doTimezoneToken(context.args);
+export function builtinTimezone(context: Detokeniser.VerbContext): string {
+  // 'timezone' needs exactly the IANA zone name to validate. Never split any further by
+  // this verb, so safe to resolve markers immediately, before use.
+  if (StringUtils.isBlank(context.args))
+    throw new Error(`Timezone token [${context.rawVerb}] needs an IANA zone name (IE. ${context.tokenStart}timezone${context.delimiter}Europe/London${context.tokenEnd})`);
+  return doTimezoneToken(context.resolveMarkers(context.args));
 }
 
-export function builtinDiff(context: Detokeniser.CallbackContext): string {
+export function builtinDiff(context: Detokeniser.VerbContext): string {
   // 'diff' needs exactly two IANA zone names — doDiffToken enforces the exact count.
-  if (StringUtils.isBlank(context.args)) throw new Error(`Diff token [${context.rawVerb}] needs 2 IANA zone names (IE. {{diff;<zoneA>;<zoneB>}})`);
-  return doDiffToken(context.args, context.delimiter);
+  if (StringUtils.isBlank(context.args))
+    throw new Error(
+      `Diff token [${context.rawVerb}] needs 2 IANA zone names (IE. ${context.tokenStart}diff${context.delimiter}<zoneA>${context.delimiter}<zoneB>${context.tokenEnd})`
+    );
+  return doDiffToken(context);
 }
 
-function doDateToken(tokenBody: string, delimiter: string): string {
+function doDateToken(context: Detokeniser.VerbContext): string {
 
   ////////////////////////////////////////////////////
   //
-  // Resolver for `[[date|...]]` tokens: starts from the current time, resolves the verb's
+  // Resolver for `<%date|...%>` tokens: starts from the current time, resolves the verb's
   // offset via the preamble/verb helpers, then formats the result. Fully synchronous — no
   // verb this token supports needs to await anything external.
 
   let date = new Date().getTime();
-  const dateTokenPrep = doDateTokenPreamble(date, tokenBody, delimiter);
+  const dateTokenPrep = doDateTokenPreamble(date, context);
   date = doDateTokenVerb(date, dateTokenPrep);
   return doDateTokenPostamble(dateTokenPrep.offsetAndFormat, date, dateTokenPrep.ianaZone);
 }
 
-function doDateTokenPreamble(date: number, tokenBody: string, delimiter: string): DateTokenPreambleReturn {
+function doDateTokenPreamble(date: number, context: Detokeniser.VerbContext): DateTokenPreambleReturn {
+  const { args: tokenBody, delimiter, escapeChar, resolveMarkers, tokenStart, tokenEnd, rawVerb } = context;
+  // The full original token, sentinel-wrapped exactly as the engine's own active boundary
+  // would render it — used in errors so a tester sees the real, failing text verbatim.
+  const rawToken = `${tokenStart}${rawVerb}${delimiter}${tokenBody}${tokenEnd}`;
 
   ////////////////////////////////////////////////////
   //
@@ -126,7 +142,7 @@ function doDateTokenPreamble(date: number, tokenBody: string, delimiter: string)
   // today, so a delimiter character embedded in them is a low-probability risk in practice,
   // but finding the call's own real closing ')' before splitting at all means this verb never
   // has to re-derive that correctness independently of random|from(...)'s identical need.
-  const leadingCall = findLeadingParenCall(tokenBody.trim());
+  const leadingCall = findLeadingParenCall(tokenBody.trim(), escapeChar);
   let offsetExpr: string;
   let formatAndZoneText: string;
   if (leadingCall) {
@@ -155,13 +171,19 @@ function doDateTokenPreamble(date: number, tokenBody: string, delimiter: string)
   // and corrupt it. See doRandomToken's identical note (randomBuiltins.ts) for its date(...)
   // sub-variant.
   const formatAndZone = StringUtils.splitRemaining(formatAndZoneText, delimiter, 2);
-  const offsetAndFormat = [offsetExpr, formatAndZone[0]];
-  const ianaZone = formatAndZone[1];
+  // Every piece above was extracted by splitting marker-safe text (findLeadingParenCall/
+  // splitRemaining never see real nested-token content, only opaque markers standing in for
+  // it) — only now, once each piece is isolated as its own leaf value, is it safe to resolve
+  // markers in it and get back the real content a nested token (e.g. <%timezone|...%> as the
+  // zone, or <%setting|...%> as the format string) actually resolved to.
+  const offsetAndFormat = [resolveMarkers(offsetExpr), resolveMarkers(formatAndZone[0])];
+  const ianaZone = formatAndZone[1] !== undefined ? resolveMarkers(formatAndZone[1]) : undefined;
 
   // Must have an actual format — formatAndZoneText was blank if either no delimiter followed
   // the offset expression at all, or (for a name(...)-shaped call) nothing trailed its own
   // closing ')'.
-  if (StringUtils.isBlank(formatAndZone[0])) throw new Error("Date token does not have a format parameter; example: {date;today;dd-MM-yyyy}");
+  if (StringUtils.isBlank(formatAndZone[0]))
+    throw new Error(`Date token does not have a format parameter; example: ${tokenStart}date${delimiter}today${delimiter}dd-MM-yyyy${tokenEnd}. Got [${rawToken}]`);
   // A zone was actually supplied — validate it now, up front, rather than letting a typo
   // surface later as a confusing date-fns formatting error.
   if (ianaZone) assertValidIANAZone(ianaZone, "Date token's timezone");
@@ -172,23 +194,29 @@ function doDateTokenPreamble(date: number, tokenBody: string, delimiter: string)
     offsetAndFormat: offsetAndFormat,
     // verb is the offset expression's name only — strip everything from its own leading "("
     // onward for a matched call (e.g. "addDays(5)" → "addDays"); otherwise the whole offset
-    // expression is the verb (e.g. "today").
-    verb: (leadingCall ? offsetExpr.split("(")[0] : offsetExpr).toLowerCase().trim(),
+    // expression is the verb (e.g. "today"). Derived from offsetAndFormat[0], which is
+    // already marker-resolved.
+    verb: (leadingCall ? offsetAndFormat[0].split("(")[0] : offsetAndFormat[0]).toLowerCase().trim(),
     // params is whatever's between the matched call's own parens (e.g. "5" from
     // "addDays(5)"), taken from its own known end (not a second ".split("(")" call, which
     // would misparse a param value containing its own "(" or a quoted ")"), or undefined if
-    // there was no name(...)-shaped call at all (e.g. "today").
-    params: leadingCall ? offsetExpr.slice(offsetExpr.indexOf("(") + 1, offsetExpr.length - 1) : undefined,
+    // there was no name(...)-shaped call at all (e.g. "today"). Also derived from the
+    // already-resolved offsetAndFormat[0] — a nested token used as a verb's own parameter
+    // (e.g. addDays(<%random|digits|1%>)) is already real text by this point, not a marker.
+    params: leadingCall ? offsetAndFormat[0].slice(offsetAndFormat[0].indexOf("(") + 1, offsetAndFormat[0].length - 1) : undefined,
 
     // Pre-built, verb-specific error messages — each referencing offsetAndFormat[0] so the
     // message always reflects what was actually typed, computed once here rather than
     // separately at each call site below.
     errParseDateOffset: "Invalid Active Date offset.  Expect AddYears(n) AddMonths(n) or AddDays(n)",
     errInvalidEpoch: "Invalid Epoch offset.  Expect number of milliseconds since 1/1/1970",
-    errRandomParams: `Invalid Random params ([${offsetAndFormat[0]}]).  Expect Random(<start date>,<end date>).  Example: {date;random(1708990784000,1701360784000);yyy-MM-dd}`,
+    errRandomParams: `Invalid Random params ([${offsetAndFormat[0]}]).  Expect Random(<start date>,<end date>).  Example: ${tokenStart}date${delimiter}random(1708990784000,1701360784000)${delimiter}yyy-MM-dd${tokenEnd}`,
     errFollowingDayParams: `FollowingDay requires epoch and day name.  IE. FollowingDay(123456,wednesday)  Got ${offsetAndFormat[0]}`,
-    errInvalidDateVerb: `Invalid date verb [${offsetAndFormat[0]}].  Need: Random, Today, Now, Yesterday, Tomorrow, AddYears(n) etc... EG {date;AddDays(5);yyyy-MM-dd}`,
+    errInvalidDateVerb: `Invalid date verb [${offsetAndFormat[0]}].  Need: Random, Today, Now, Yesterday, Tomorrow, AddYears(n) etc... EG ${tokenStart}date${delimiter}AddDays(5)${delimiter}yyyy-MM-dd${tokenEnd}`,
     ianaZone: ianaZone,
+    delimiter,
+    tokenStart,
+    tokenEnd,
   };
 }
 
@@ -243,7 +271,7 @@ function doDateTokenVerb(date: number, dateTokenPrep: DateTokenPreambleReturn): 
       if (Utils.isNullOrUndefined(dateTokenPrep.params)) {
         throw new Error(dateTokenPrep.errRandomParams);
       } else {
-        returnDate = doRandomDate(dateTokenPrep.params as string);
+        returnDate = doRandomDate(dateTokenPrep.params as string, dateTokenPrep.delimiter, dateTokenPrep.tokenStart, dateTokenPrep.tokenEnd);
       }
       break;
     }
@@ -357,12 +385,14 @@ function getParsedDateOffset(numString: string | undefined, errorMessage: string
  * own `random(...)` verb and `random`'s `date(...)` sub-mode (randomBuiltins.ts) — exported
  * for that sibling file to import, not part of this package's public API.
  */
-export function doRandomDate(maxAndMinDates: string): number {
+export function doRandomDate(maxAndMinDates: string, delimiter: string, tokenStart: string, tokenEnd: string): number {
   // Expect exactly two comma-separated epoch numbers: "fromEpoch,toEpoch".
   const maxAndMin: string[] = maxAndMinDates.split(",");
 
   if (maxAndMin.length != 2 || Number.isNaN(+maxAndMin[0]) || Number.isNaN(+maxAndMin[1]))
-    throw new Error(`Invalid Maximum and Minimum dates. Expect {random;date(fromEpoch,toEpoch);<format>}. Max/min was: [${maxAndMinDates}]`);
+    throw new Error(
+      `Invalid Maximum and Minimum dates. Expect ${tokenStart}random${delimiter}date(fromEpoch,toEpoch)${delimiter}<format>${tokenEnd}. Max/min was: [${maxAndMinDates}]`
+    );
   const minDate = Number(maxAndMin[0]);
   const maxDate = Number(maxAndMin[1]);
   if (minDate > maxDate) throw new Error(`Minimum date greater than maximum!! Max/min was: [${maxAndMinDates}]`);
@@ -375,7 +405,7 @@ export function doRandomDate(maxAndMinDates: string): number {
  * Throws a clear, actionable error if `zone` is not a real, recognised IANA timezone name.
  * Shared validation for the `timezone`/`diff` tokens and the `date` token's optional 3rd
  * (zone) part — every one of them accepts a raw IANA zone string, whether typed directly or
- * produced by nesting `[[timezone|...]]]`, so they all validate it identically.
+ * produced by nesting `<%timezone|...%>`, so they all validate it identically.
  *
  * Deliberately validated by attempting to construct an `Intl.DateTimeFormat` with the given
  * zone, rather than checking membership in `Intl.supportedValuesOf("timeZone")` — the latter
@@ -403,7 +433,7 @@ function doTimezoneToken(tokenBody: string): string {
 
   ////////////////////////////////////////////////////
   //
-  // Resolves a `[[timezone|<IANAZoneName>]]` token: just validates the given zone name and
+  // Resolves a `<%timezone|<IANAZoneName>%>` token: just validates the given zone name and
   // returns it unchanged — the "standard form" other tokens (date's zone part, diff) expect
   // is simply the validated IANA zone string itself, so this doubles as both a validator and
   // a pass-through, nestable directly inside those other tokens' own argument lists.
@@ -413,11 +443,15 @@ function doTimezoneToken(tokenBody: string): string {
   return zone;
 }
 
-function doDiffToken(tokenBody: string, delimiter: string): string {
+function doDiffToken(context: Detokeniser.VerbContext): string {
+  const { args: tokenBody, delimiter, resolveMarkers, tokenStart, tokenEnd, rawVerb } = context;
+  // The full original token, sentinel-wrapped exactly as the engine's own active boundary
+  // would render it — shown in errors so a tester sees the real, failing text verbatim.
+  const rawToken = `${tokenStart}${rawVerb}${delimiter}${tokenBody}${tokenEnd}`;
 
   ////////////////////////////////////////////////////
   //
-  // Resolves a `[[diff|<zoneA>|<zoneB>]]` token: validates both zone names, looks up each
+  // Resolves a `<%diff|<zoneA>|<zoneB>%>` token: validates both zone names, looks up each
   // one's current UTC offset (DST-aware, since it's resolved "now" rather than from a fixed
   // per-zone constant), and returns zoneA's offset minus zoneB's, in hours, as a plain
   // decimal number string. "UTC" is itself a valid zone, so a single zone's offset from UTC
@@ -425,10 +459,14 @@ function doDiffToken(tokenBody: string, delimiter: string): string {
 
   // Quote-aware: zoneA (the only one of the two that isn't the final, absorbed field) can
   // be wrapped in '...'/"..." — no real IANA zone name needs this, but it costs nothing and
-  // keeps every built-in's top-level split working the same way.
-  const [zoneA, zoneB] = StringUtils.splitRemainingQuoted(tokenBody, delimiter, 2);
+  // keeps every built-in's top-level split working the same way. Split on marker-safe text
+  // first (e.g. <%diff|<%timezone|Africa/Lusaka%>|<%timezone|Europe/London%>%> — each zone is
+  // itself a nested token's marker at this point), then resolve each extracted zone to its
+  // real name before validating/using it.
+  const [zoneA, zoneB] = StringUtils.splitRemainingQuoted(tokenBody, delimiter, 2).map(resolveMarkers);
   // Both zones are mandatory — there's no meaningful "diff" with only one side given.
-  if (!zoneA || !zoneB) throw new Error(`Diff token needs 2 IANA zone names (IE. {{diff;<zoneA>;<zoneB>}}). Got [${tokenBody}]`);
+  if (!zoneA || !zoneB)
+    throw new Error(`Diff token needs 2 IANA zone names (IE. ${tokenStart}diff${delimiter}<zoneA>${delimiter}<zoneB>${tokenEnd}). Got [${rawToken}]`);
   assertValidIANAZone(zoneA, "Diff token's first zone");
   assertValidIANAZone(zoneB, "Diff token's second zone");
 

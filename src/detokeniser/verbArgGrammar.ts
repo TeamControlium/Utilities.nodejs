@@ -14,20 +14,22 @@
 
 /**
  * Finds the index of the `)` that closes the `(` at `openParenIndex` in `text`, skipping past
- * anything that isn't actually closing the call: an escaped `/)` (the default escape char),
- * and any character — including a literal `)` or a delimiter character — sitting inside a
+ * anything that isn't actually closing the call: an escaped close (e.g. `` `) `` under the
+ * engine's default escape char, passed in as `escapeChar` — never hardcoded, so this stays in
+ * sync with {@link Detokeniser.EscapeChar} rather than silently diverging from it), and any
+ * character — including a literal `)` or a delimiter character — sitting inside a
  * `'...'`/`"..."` quoted span. Quote awareness matters because a call's own quoted-argument
  * content (e.g. `from('a)','b)')`'s items) can legitimately contain `)`, the delimiter, or
  * anything else inside an item.
  * @returns The index of the matching `)`, or `-1` if `text` runs out first — an unclosed `(`,
  *   or an unclosed quote inside it.
  */
-export function findMatchingParenClose(text: string, openParenIndex: number): number {
+export function findMatchingParenClose(text: string, openParenIndex: number, escapeChar: string): number {
   let openQuoteChar: string | undefined;
   let index = openParenIndex + 1;
   while (index < text.length) {
     const char = text[index];
-    if (char === "/" && index + 1 < text.length) {
+    if (char === escapeChar && index + 1 < text.length) {
       // Escaped character — skip both; never structurally significant, inside or outside a
       // quoted span.
       index += 2;
@@ -71,10 +73,10 @@ export function findMatchingParenClose(text: string, openParenIndex: number): nu
  *   since different verbs shape it differently (`random`'s is `[type, length]`; `date`'s own
  *   top-level split has a 3rd, optional zone part on top).
  */
-export function findLeadingParenCall(tokenBody: string): { call: string; remainder: string } | undefined {
+export function findLeadingParenCall(tokenBody: string, escapeChar: string): { call: string; remainder: string } | undefined {
   const leadingCallMatch = /^[A-Za-z][A-Za-z0-9]*\(/.exec(tokenBody);
   if (!leadingCallMatch) return undefined;
-  const closeParenIndex = findMatchingParenClose(tokenBody, leadingCallMatch[0].length - 1);
+  const closeParenIndex = findMatchingParenClose(tokenBody, leadingCallMatch[0].length - 1, escapeChar);
   if (closeParenIndex === -1) return undefined;
   return { call: tokenBody.slice(0, closeParenIndex + 1), remainder: tokenBody.slice(closeParenIndex + 1) };
 }
